@@ -1741,7 +1741,7 @@ def weekly_plan(
     from tradecompass.account.behavior import analyze
     from tradecompass.market.regime import build_series
     from tradecompass.research import data as rdata
-    from tradecompass.research.etfs import ETFS
+    from tradecompass.research.etfs import ETFS, etf_roles
     from tradecompass.research.panel import load_panel
     from tradecompass.research.rolling import RollingEngine, group_indices, trend_tilt
     from tradecompass.research.weekly_plan import (
@@ -1781,6 +1781,7 @@ def weekly_plan(
         base_targets=base,
         etf_bars={c: rdata.read_etf_bars(cfg.paths, c) for c in etf_codes},
         etf_names={e.code: e.name for e in ETFS},
+        etf_roles=etf_roles(),
         names=names, max_new_buys=max_new_buys,
         cleanup_since=state.get("cleanup_since", {}),
     )
@@ -1829,9 +1830,18 @@ def weekly_plan(
         )
 
     notes = []
+    confirm_path = cfg.paths.home / "portfolio" / "confirmations.yaml"
+    confirmed = (
+        yaml.safe_load(confirm_path.read_text(encoding="utf-8")) or {}
+        if confirm_path.exists()
+        else {}
+    )
     for code, diff in account.get("reconcile_opening_or_unlisted", {}).items():
         held = int(holdings.loc[holdings.code == code, "quantity"].sum())
-        if diff < 0:
+        item = confirmed.get(code) or confirmed.get(str(code).zfill(6)) or {}
+        if diff < 0 and int(item.get("quantity", -1)) == held:
+            notes.append(f"{code}：持仓 {held} 份已人工确认（{item.get('note', '')}）。")
+        elif diff < 0:
             notes.append(
                 f"{code}：流水推算应为 {held - diff} 份，持仓快照为 {held} 份——"
                 "对账单最后一天的成交可能未进流水，请在 APP 核对；本报告以快照为准。"

@@ -1,8 +1,11 @@
-"""ETF 判定池：宽基、行业、跨境三类；底仓 ETF 只做再平衡。
+"""ETF 判定池：按品种分宽基/行业/跨境，按操作角色分底仓/稳健/波段。
 
-名单为常见的宽基/行业/跨境 ETF（2026-10 人工整理）。
-名单本身是“现在”选出来的，有幸存者偏差：回测里每只 ETF 上市满 250 日才可选，
-且报告需注明这一点。
+- 底仓：只做再平衡（目标比例在 universe.yaml）；
+- 稳健：宽基、红利/自由现金流、海外宽基，长期持有，不做波段；
+- 波段：行业/主题 ETF，属于波段仓。动量轮动版本已实测无效，波段规则仍待研究。
+
+行业 ETF 只在对应行业指数数据缺失时作为参考；当前用成分股合成的板块指数，数据完整。
+名单为常见品种（2026-10 人工整理），有幸存者偏差：回测里每只 ETF 上市满 250 日才可选。
 """
 
 from __future__ import annotations
@@ -66,6 +69,23 @@ ETFS: tuple[EtfInfo, ...] = (
 )
 
 ROTATION_CATEGORIES = ("宽基", "行业")
+
+# 红利/现金流类与海外宽基虽不在“宽基”品类，但操作上属于稳健持有
+STEADY_EXTRA = frozenset(
+    {"sh.515080", "sz.159201", "sh.513910", "sh.513100", "sz.159501", "sh.513400"}
+)
+
+
+def role_of(info: EtfInfo) -> str:
+    if info.category == "底仓":
+        return "底仓"
+    if info.category == "宽基" or info.code in STEADY_EXTRA:
+        return "稳健"
+    return "波段"
+
+
+def etf_roles() -> dict[str, str]:
+    return {info.code: role_of(info) for info in ETFS}
 
 
 def etf_by_code() -> dict[str, EtfInfo]:

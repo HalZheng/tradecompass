@@ -90,6 +90,30 @@ def _cleanup(price: float, ma10: float | None, ma20: float | None) -> tuple[str,
     return "清理：反弹分批", f"{targets[0]:.3f} 卖一半，{targets[1]:.3f} 卖剩余"
 
 
+def etf_action(
+    role: str,
+    code: str,
+    price: float,
+    ma10: float | None,
+    ma20: float | None,
+    base_targets: dict[str, float],
+) -> tuple[str, str]:
+    """底仓再平衡、稳健持有、波段（暂行：站上 MA20 持有观察，跌破则反弹减仓）。"""
+    if code in base_targets:
+        return "底仓：保留", f"目标占底仓 {base_targets[code]:.0%}，见底仓再平衡"
+    if role == "稳健":
+        trend = ""
+        if ma20 is not None:
+            trend = "；在 MA20 上方" if price >= ma20 else "；在 MA20 下方，不低位卖出"
+        return "稳健：持有", "稳健类 ETF 长期持有，不做波段" + trend
+    if ma20 is not None and price >= ma20:
+        return "波段：持有观察", (
+            "站上 MA20；波段规则待验证（暂行），不新增，跌破 MA20 后改为反弹减仓"
+        )
+    action, detail = _cleanup(price, ma10, ma20)
+    return action, "波段 ETF 跌破 MA20（暂行规则）；" + detail
+
+
 def _half_lot(quantity: int) -> int:
     if quantity < 2 * LOT:
         return quantity
@@ -135,6 +159,7 @@ def build_plan(
     etf_bars: dict[str, pd.DataFrame],
     etf_names: dict[str, str],
     names: dict[str, str],
+    etf_roles: dict[str, str] | None = None,
     stock_share: float = 0.5,
     max_new_buys: int = 3,
     cleanup_since: dict[str, str] | None = None,
@@ -172,12 +197,11 @@ def build_plan(
         pnl = price / cost - 1.0 if cost else 0.0
         if bs in etf_names:
             ma10, ma20, ma60 = _etf_mas(etf_bars.get(bs, pd.DataFrame()))
-            if code in base_targets:
-                action, detail = "底仓：保留", f"目标占底仓 {base_targets[code]:.0%}，见底仓再平衡"
-            else:
-                action, detail = _cleanup(price, ma10, ma20)
+            role = (etf_roles or {}).get(bs, "波段")
+            action, detail = etf_action(role, code, price, ma10, ma20, base_targets)
+            group = "底仓" if code in base_targets else f"ETF·{role}"
             views.append(HoldingView(code, name_, "ETF", qty, price, cost, value,
-                                     pnl, "ETF", None, None, ma10, ma20, ma60, action, detail))
+                                     pnl, group, None, None, ma10, ma20, ma60, action, detail))
             continue
         j = engine.col.get(bs)
         ma10 = ma20 = ma60 = None
@@ -277,7 +301,9 @@ def render_plan(
     stock_value = sum(v.value for v in views if v.kind == "股票")
     etf_value = sum(v.value for v in views if v.kind == "ETF")
     base_value = sum(v.value for v in views if v.code in base_targets)
-    keep = [v for v in views if v.action.startswith(("保留", "底仓"))]
+    steady_value = sum(v.value for v in views if v.group == "ETF·稳健")
+    swing_value = sum(v.value for v in views if v.group == "ETF·波段")
+    keep = [v for v in views if v.action.startswith(("保留", "底仓", "稳健", "波段"))]
     clean = [v for v in views if v.action.startswith("清理")]
     clean_value = sum(v.value for v in clean)
     deep = "、".join(
@@ -293,13 +319,13 @@ def render_plan(
         "",
         "## 一、结论",
         "",
-        f"- 现有 {len(views)} 个持仓过于分散；按策略只需 **{len(keep)} 个保留**，"
+        f"- 现有 {len(views)} 个持仓：**{len(keep)} 个保留/持有**，"
         f"**{len(clean)} 个进入存量清理**（市值约 {clean_value:,.0f} 元），**不在低点一次性割**，"
         "挂反弹条件单分批卖。",
         f"- {target_day}最多新买 **{max_new_buys} 只**策略标的，先用现金 {cash:,.0f} 元；"
         "清理回笼的钱由之后每天的报告继续安排。",
-        "- 底仓（沪深300ETF/黄金ETF/30年国债ETF）偏低，清理回笼资金优先补底仓与策略名额，"
-        "不再买行业/跨境 ETF。",
+        "- 底仓（沪深300ETF/黄金ETF/30年国债ETF）偏低，清理回笼资金优先补底仓与策略名额；"
+        "稳健类 ETF（宽基/红利/现金流）继续持有；波段类 ETF 规则待验证，暂不新增。",
         "",
         "## 二、账户现状（对账单 10-23）",
         "",
@@ -309,6 +335,8 @@ def render_plan(
         f"| 个股市值 | {stock_value:,.0f} | {stock_value / total:.0%} |",
         f"| ETF 市值 | {etf_value:,.0f} | {etf_value / total:.0%} |",
         f"| 其中底仓 ETF | {base_value:,.0f} | {base_value / total:.0%}（目标 50%） |",
+        f"| 其中稳健 ETF | {steady_value:,.0f} | {steady_value / total:.0%} |",
+        f"| 其中波段 ETF | {swing_value:,.0f} | {swing_value / total:.0%} |",
         f"| 可用现金（含天天宝） | {cash:,.0f} | {cash / total:.0%} |",
         "",
         "## 三、市场与板块状态（只用截至 10-23 的数据）",
@@ -335,8 +363,8 @@ def render_plan(
     def fmt(v: float | None) -> str:
         return f"{v:.3f}" if v is not None else "-"
 
-    order = {"保留": 0, "底仓：保留": 1}
-    for v in sorted(views, key=lambda x: (order.get(x.action, 2), x.pnl_pct)):
+    order = {"保留": 0, "底仓：保留": 1, "稳健：持有": 2, "波段：持有观察": 3}
+    for v in sorted(views, key=lambda x: (order.get(x.action, 4), x.pnl_pct)):
         where = f"{v.group} #{v.rank}" if v.rank else v.group
         lines.append(
             f"| {v.code} | {v.name} | {v.quantity} | {v.price:.3f} | {v.cost:.3f} | "

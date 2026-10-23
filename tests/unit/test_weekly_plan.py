@@ -5,7 +5,21 @@ from __future__ import annotations
 import pandas as pd
 
 from tradecompass.account.behavior import analyze
-from tradecompass.research.weekly_plan import HoldingView, _cleanup, apply_patience
+from tradecompass.research.etfs import etf_roles
+from tradecompass.research.weekly_plan import HoldingView, _cleanup, apply_patience, etf_action
+
+
+def test_etf_roles_and_actions() -> None:
+    roles = etf_roles()
+    assert roles["sh.510300"] == "底仓"
+    assert roles["sz.159201"] == "稳健" and roles["sh.513910"] == "稳健"
+    assert roles["sz.159992"] == "波段"
+    base = {"510300": 0.4}
+    assert etf_action("底仓", "510300", 4.0, 3.9, 3.8, base)[0] == "底仓：保留"
+    assert etf_action("稳健", "159201", 0.9, 1.0, 1.0, base)[0] == "稳健：持有"
+    assert etf_action("波段", "159992", 1.1, 1.0, 1.0, base)[0] == "波段：持有观察"
+    action, detail = etf_action("波段", "159992", 0.9, 1.0, 1.0, base)
+    assert action.startswith("清理") and "暂行" in detail
 
 
 def trades() -> pd.DataFrame:
