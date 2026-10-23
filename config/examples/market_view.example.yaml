@@ -1,0 +1,11 @@
+# 人工主线判断：系统只把它当过滤器，不做预测（SPEC §9.5）
+# 每周复盘时更新 updated；超过 market.market_view_stale_days 天后 favor/avoid 会被忽略并提示过期。
+
+updated: 2026-10-21   # 改成你最近一次复盘当天
+
+favor_sectors: []     # 同等条件下排序靠前，例如: [电子, 电力设备]
+avoid_sectors: []     # 买入信号降级为 watch（R3c），例如: [房地产]
+
+notes: []             # 仅展示在推送里，不参与判断
+#  - 政策面：某某会议定调
+#  - 风险点：某板块拥挤度过高

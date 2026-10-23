@@ -1,0 +1,26 @@
+# 策略 A：周线 KDJ 低位回调（SPEC §9.7）
+# 启用前提：必须先在 backtest_runs 里有同 strategy_id + params_hash 且 passed=1 的记录（SPEC §9.1）
+
+id: b1_pullback
+enabled: false
+
+params:
+  timeframe: weekly      # weekly | daily
+  weekly_ma: 20          # A1：周线收盘 > 周 MA20
+  slope_lookback: 5      # A1：周 MA20 向上
+  weekly_j_max: 20       # A2：完结周线 J 值低于此
+  daily_j_max: 0         # timeframe=daily 时：近 3 日内日线 J 值低于此
+  confirm_ma: 5          # A3：日线收盘 > MA5 且 > 前一日最高
+  entry_mode: breakout_high   # breakout_high | next_open
+
+exits:
+  atr_mult: 2.0          # X1
+  max_stop_pct: 0.10     # X2
+  trail_ma: 10           # X3
+  trail_atr_mult: 3.0    # X4
+  time_stop: {enabled: true, days: 20}    # X5
+  partial: {enabled: false, r: 2.0}       # X6
+
+grid:                    # 仅 backtest run --grid 时使用
+  weekly_j_max: [10, 20, 30]
+  atr_mult: [1.5, 2.0, 2.5]

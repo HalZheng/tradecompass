@@ -1,0 +1,23 @@
+# 自选池：标的、分类、底仓目标比例
+# 模板只使用公开的宽基/行业 ETF 作占位示例，请替换成自己的标的。
+
+instruments:
+  # 底仓：长期持有，只做再平衡。所有 base_etf 的 target 之和必须为 1.0。
+  - {symbol: "510300", market: SH, name: 沪深300ETF, kind: base_etf, target: 0.4}
+  - {symbol: "518880", market: SH, name: 黄金ETF, kind: base_etf, target: 0.3, t0: true}
+  - {symbol: "511090", market: SH, name: 30年国债ETF, kind: base_etf, target: 0.3, t0: true}
+
+  # 波段仓：按策略信号进出，同时持有数受 risk.yaml 的 max_positions 限制
+  - {symbol: "512880", market: SH, name: 证券ETF, kind: sector_etf, sector_sw: 非银金融}
+  - {symbol: "600000", market: SH, name: 示例股票, kind: stock, sector_sw: 银行}
+
+# 字段说明
+#   symbol    6 位代码（字符串，保留前导零）
+#   market    SH / SZ / BJ
+#   kind      stock 个股 | sector_etf 行业主题 ETF | base_etf 底仓 | index 指数
+#   target    仅 base_etf 可用，占底仓总额的比例
+#   sector_sw 申万一级行业名，用于行业强弱过滤（R3b）
+#   t0        是否 T+0（跨境/黄金/债券 ETF），默认 false
+#   is_st     是否 ST，影响涨跌停幅度（5%）
+#
+# 代码前缀速查：60/68 沪市，00/30 深市，8/4/92 北交所，5/1/15/16 开头为基金

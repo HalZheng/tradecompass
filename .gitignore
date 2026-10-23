@@ -1,0 +1,31 @@
+# 个人配置 / 数据 / 产物一律在 TC_HOME（仓库外），仓库内只留模板
+.env
+/local/
+/data/
+/reports/
+/logs/
+*.parquet
+*.sqlite
+*.db
+
+# 私有文档 / agent 记忆 / 研究脚本 / 迁移包：不入公开仓库
+.workbuddy/
+discuss records/
+/private_bundle/
+/.private_bundle/
+/first-prompt.md
+/SPEC.md
+/docs/DECISIONS.md
+/scripts/
+*.zip
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/

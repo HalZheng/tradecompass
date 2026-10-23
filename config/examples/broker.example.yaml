@@ -1,0 +1,28 @@
+# 交割单列映射与操作文本映射（SPEC §11.1）
+# 每个内部字段可给多个候选列名，取第一个在文件里存在的。
+
+default: eastmoney
+
+mappings:
+  eastmoney:
+    columns:
+      trade_date: [成交日期]
+      trade_time: [成交时间]
+      symbol: [证券代码]
+      name: [证券名称]
+      side_text: [操作, 业务名称]
+      quantity: [成交数量]
+      price: [成交均价, 成交价格]
+      amount: [成交金额]
+      fee_commission: [手续费, 佣金]
+      fee_stamp: [印花税]
+      fee_transfer: [过户费]
+      fee_other: [其他费]
+      trade_id: [成交编号, 合同编号]
+    sides:
+      buy: [证券买入]
+      sell: [证券卖出]
+      dividend: [红利入账]
+      bonus_share: [红股入账]
+      tax: [股息红利税补缴]
+      ignore: [银证转入, 银证转出, 利息归本, 银行转证券, 证券转银行]

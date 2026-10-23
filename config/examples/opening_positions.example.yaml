@@ -1,0 +1,16 @@
+# 期初持仓快照（可选）
+#
+# 用途：还没有导入交割单时，让 `daily` 知道当前仓位与成本。
+# 有 trades 流水后，系统以 `import-trades` 导入的流水为准，本文件不再参与。
+#
+# 字段：
+#   as_of     快照日期（用于提示陈旧程度）
+#   cash      可用现金（元）；risk.yaml 的 cash 也会被使用
+#   positions 每只持仓的代码、名称、股数、摊薄成本（不复权实际价）
+
+as_of: 2026-10-22
+cash: 0
+
+positions:
+  - {symbol: "510300", name: 沪深300ETF, quantity: 800, avg_cost: 3.043}
+  - {symbol: "518880", name: 黄金ETF, quantity: 1700, avg_cost: 9.005}

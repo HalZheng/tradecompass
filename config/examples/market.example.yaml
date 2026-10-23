@@ -1,0 +1,22 @@
+# 市场环境层参数与样本指数（SPEC §9.3）
+
+indices:
+  hs300: "000300"
+  csi1000: "000852"
+  breadth_universe: "000906"   # 中证800，用于市场宽度与涨跌停统计
+  turnover: ["000001", "399001"]  # 上证指数 + 深证成指，成交额之和
+
+breadth:
+  above_ma: 20   # 收盘 > 日 MA20 视为站上
+  high: 0.5      # 比例 > high 得 +1
+  low: 0.3       # 比例 < low 得 -1
+
+turnover_ma: 60     # 成交额均值的窗口
+limit_net_days: 5   # 涨停数减跌停数的统计窗口
+
+levels:
+  attack_min: 3      # 总分 >= 3 为进攻
+  defense_max: 0     # 总分 <= 0 为防守
+  confirm_days: 2    # 新档位需连续满足的天数（防抖）
+
+market_view_stale_days: 14   # 人工主线超过此天数则忽略并提示过期

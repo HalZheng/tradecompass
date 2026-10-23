@@ -1,0 +1,9 @@
+# 存量清理（SPEC §9.11）
+# 管理类策略：不受「启用前必须通过回测」的约束。只作用于 category = legacy 的持仓。
+
+id: legacy_cleanup
+enabled: true
+
+params:
+  fragment_amount: 5000   # 市值低于此值归为 fragment，直接进清理
+  deadline_weeks: 8       # 自 D0 起超过此周数仍有余量，则此后每周一卖剩余的 1/2

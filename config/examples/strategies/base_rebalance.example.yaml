@@ -1,0 +1,10 @@
+# 底仓再平衡（SPEC §9.10）
+# 管理类策略：不受「启用前必须通过回测」的约束（SPEC §9.1）。
+
+id: base_rebalance
+enabled: true
+
+params:
+  band: 0.05           # 实际占比偏离 target 超过此值即触发
+  min_amount: 2000     # 单笔调整金额下限，低于此值不生成
+  premium_max: 0.03    # 跨境 ETF 溢价率上限；数据不可用时跳过此过滤

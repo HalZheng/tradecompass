@@ -1,0 +1,29 @@
+# 数据源、调度时间、推送开关与限流
+# 所有键都有代码内默认值，这里只写需要覆盖的项；未知键会直接报错。
+
+data:
+  # 不复权日线的源优先级（SPEC §8.1）。若某源不支持不复权，会在数据层被排除。
+  raw_sources: [baostock, akshare, mootdx, efinance]
+  # 复权因子的源（至少两个，用于交叉校验）
+  factor_sources: [baostock, akshare]
+  history_years: 6
+
+schedule:
+  timezone: Asia/Shanghai
+  heartbeat: "09:15"
+  intraday_start: "09:30"
+  intraday_end: "15:00"
+  intraday_poll_seconds: 120
+  eod_sync: "15:30"
+  eod_compute: "16:00"
+  eod_push: "16:30"
+  weekly: "FRI 18:00"
+  # 设置后每日 20:00 自动导入该目录下的新交割单；null 表示关闭
+  trade_file_watch_dir: null
+
+notify:
+  # false 时所有推送改为写入 TC_HOME/logs/push_preview/*.md
+  enabled: false
+
+limits:
+  max_non_urgent_push_per_day: 10

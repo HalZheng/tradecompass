@@ -1,0 +1,85 @@
+[project]
+name = "tradecompass"
+version = "0.1.0"
+description = "A-share multi-factor signal system: B1/B2/S1/S2 daily alerts, risk caps and backtests. No LLM in decisions."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pandas>=2,<3",
+    "numpy>=1.26",
+    "pyarrow>=14",
+    "pydantic>=2",
+    "pyyaml>=6",
+    "python-dotenv>=1",
+    "httpx>=0.27",
+    "aiohttp>=3.9",
+    "requests>=2.31",
+    "tenacity>=8.2",
+    "akshare>=1.12",
+    "baostock>=0.8",
+    "efinance>=0.5.5",
+    "exchange-calendars>=4.5",
+    "apscheduler>=3.10,<4",
+    "lark-oapi>=1.0",
+    "jinja2>=3",
+    "plotly>=5",
+    "typer>=0.12",
+    "rich>=13",
+]
+
+[project.optional-dependencies]
+# mootdx 钉死 httpx<0.26，与本项目的 httpx>=0.27 冲突，故不放进默认依赖。
+# 需要通达信源时单独安装：pip install -e ".[tdx]"（会降级 httpx，可能影响其他部件）
+tdx = ["mootdx>=0.11", "pytdx>=1.72"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "types-PyYAML",
+    "types-requests",
+    # 版本号需与 pandas 小版本对齐，否则 mypy 会报大量误报
+    "pandas-stubs==2.3.3.*",
+]
+
+[project.scripts]
+tradecompass = "tradecompass.cli:app"
+
+[build-system]
+requires = ["setuptools>=69.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tradecompass*"]
+namespaces = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# 报告模板里是整段 HTML/CSS，按 Python 行宽去切没有意义
+"src/tradecompass/backtest/report.py" = ["E501"]
+"tests/unit/test_account.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["akshare.*", "baostock.*", "mootdx.*", "pytdx.*", "efinance.*", "exchange_calendars.*", "lark_oapi.*", "plotly.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not network'"
+markers = [
+    "network: 需要真实网络/外部端点的测试，默认不运行",
+    "slow: 耗时较长的测试",
+]

@@ -1,0 +1,22 @@
+# 策略 B：放量突破（SPEC §9.8）
+# 启用前提同策略 A：必须通过回测验收。
+
+id: volume_breakout
+enabled: false
+
+params:
+  lookback: 60           # B1：收盘创 N 日新高（不含当日）
+  vol_mult: 2.0          # B2：成交量 > N 日均量 × 此倍数
+  entry_mode: next_open  # 次日开盘买入
+
+exits:
+  atr_mult: 2.0
+  max_stop_pct: 0.10
+  trail_ma: 10
+  trail_atr_mult: 3.0
+  time_stop: {enabled: true, days: 20}
+  partial: {enabled: false, r: 2.0}
+
+grid:
+  lookback: [40, 60, 80]
+  vol_mult: [1.5, 2.0, 2.5]

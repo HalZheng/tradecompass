@@ -1,0 +1,35 @@
+# 回测：成本、样本切分、验收门槛（SPEC §12）
+
+years: 5               # 回测区间（近 N 年）
+in_sample_ratio: 0.7   # 前 70% 为样本内，参数网格只在样本内评估
+
+costs:
+  commission: 0.00025   # 股票佣金费率（万 2.5）
+  # 场内基金（ETF/LOF）与债券的佣金，常与股票不同；留空则沿用 commission。
+  # 例：某券商股票万 1.654、ETF 万 1.8，就写 0.0001654 与 0.00018。
+  commission_fund: null
+  commission_min: 5     # 股票单笔最低佣金（元）。单笔低于 3 万元时这一项会主导成本。
+  # 基金单笔最低佣金。多数券商对 ETF 免五，实测 1 万元的 ETF 买入只收 1.80 元。
+  commission_min_fund: 0
+  stamp_sell: 0.0005    # 印花税，仅股票卖出，ETF 免
+  transfer: 0.00001     # 过户费，仅沪深股票
+  slippage: 0.001       # 单边滑点
+
+max_gap_open: 0.05      # 开盘涨幅超过此值放弃买入
+
+random:
+  size: 50              # 随机样本每组的标的数
+  repeats: 3            # 随机样本组数
+  seed: 42
+  entry_runs: 100       # 随机入场基准的重复次数
+
+acceptance:
+  min_trades: 30            # 样本内交易笔数下限
+  min_pf_in: 1.3            # 样本内利润因子下限
+  min_pf_out: 1.1           # 样本外利润因子下限
+  min_pf_out_ratio: 0.6     # 样本外 / 样本内 利润因子比值下限
+  min_expectancy_r: 0.3     # 单笔期望（扣成本，单位 R）
+  max_dd_vs_bh: 0.7         # 最大回撤 <= 等权买入持有回撤 × 此系数
+  min_random_pct: 0.8       # 利润因子需超过随机入场分布的第 80 百分位
+  grid_pass_ratio: 0.7      # 参数 ±20% 网格中利润因子 > 1 的比例
+  random_sample_pass: 2     # 3 组随机样本中至少 2 组通过
