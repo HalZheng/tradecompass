@@ -40,6 +40,22 @@ def _logout() -> None:
         _logged_in = False
 
 
+def login() -> None:
+    """供研究模块复用同一个会话。"""
+    _login()
+
+
+def relogin() -> None:
+    """超时后旧连接状态不可信，强制重建会话。"""
+    global _logged_in
+    try:
+        bs.logout()
+    except OSError:
+        pass
+    _logged_in = False
+    _login()
+
+
 def bs_code(query: BarQuery) -> str:
     return f"{query.market.lower()}.{query.symbol}"
 

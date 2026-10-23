@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import io
 import os
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import date
@@ -26,6 +28,11 @@ from tradecompass.log import configure as configure_logging
 from tradecompass.storage.db import StorageError, require_ready
 
 APP_NAME = "TradeCompass"
+
+# 非中文 Windows 控制台（cp1252）下 rich 输出中文会直接崩溃。
+for _stream in (sys.stdout, sys.stderr):
+    if isinstance(_stream, io.TextIOWrapper) and (_stream.encoding or "").lower() != "utf-8":
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 app = typer.Typer(
     add_completion=False,
@@ -801,6 +808,66 @@ def backtest_b2(
     console.print(f"报告：{escape(str(path))}")
 
 
+@app.command("import-statement")
+def import_statement(
+    file: Annotated[Path, typer.Argument(help="东方财富股票明细对账单 PDF")],
+    home: HomeOption = None,
+    update_opening: Annotated[
+        bool, typer.Option("--update-opening/--no-update-opening", help="用持仓快照覆盖期初持仓")
+    ] = True,
+) -> None:
+    """解析对账单 PDF：余额链校验 → 剔除天天宝 → 写入 portfolio/ 与期初持仓。"""
+    import shutil
+
+    import yaml
+
+    from tradecompass.account.statement_pdf import export, read_pdf
+
+    try:
+        cfg = load_config(resolve_home(home))
+    except ConfigError as exc:
+        _fail(str(exc))
+        return
+    st = read_pdf(file)
+    if st.issues:
+        for issue in st.issues[:20]:
+            console.print("  ✗ " + escape(issue), style="red")
+        _fail(f"对账单校验未通过（{len(st.issues)} 处），未写入任何文件", code=3)
+        return
+    paths = export(st, cfg.paths.home / "portfolio" / "eastmoney")
+    raw_dir = cfg.paths.data / "statements"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    # 原件含证件号，只放在不进 git 的 data/ 下
+    shutil.copy2(file, raw_dir / f"eastmoney_{st.start}_{st.end}.pdf")
+    console.print(
+        f"区间 {st.start} → {st.end}；流水 {len(st.rows)} 行（保留 {len(st.kept_rows())}，"
+        f"剔除天天宝/现金宝 {len(st.rows) - len(st.kept_rows())}）；持仓 {len(st.holdings)} 只；"
+        "余额链与持仓合计校验通过"
+    )
+    for name, path in paths.items():
+        console.print(f"  {name}: {escape(str(path))}")
+    if update_opening and st.end:
+        cash = st.summary.get("资金可用", 0.0)
+        payload = {
+            "as_of": st.end,
+            "cash": cash,
+            "positions": [
+                {"symbol": h.code, "name": h.name, "quantity": h.quantity, "avg_cost": h.cost}
+                for h in st.holdings
+            ],
+        }
+        target = cfg.paths.config / "opening_positions.yaml"
+        header = (
+            f"# 期初持仓快照（来源：东方财富对账单 PDF，{st.end} 收盘；成本为券商摊薄成本）\n"
+            "# 由 tradecompass import-statement 生成；cash = 资金可用（含天天宝）\n"
+        )
+        target.write_text(
+            header + yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        console.print(f"期初持仓已更新：{escape(str(target))}（现金 {cash:,.2f}）")
+
+
 @app.command("import-trades")
 def import_trades(
     file: Annotated[Path, typer.Argument(help="交割单文件（csv/txt/xlsx/xls）")],
@@ -1328,3 +1395,493 @@ def _format_factor(value: object, percent: bool) -> str:
     if isinstance(value, float):
         return f"{value:+.1%}" if percent else f"{value:.2f}"
     return str(value)
+
+
+research_app = typer.Typer(
+    add_completion=False, no_args_is_help=True, help="横截面因子研究（历史成分股池）"
+)
+app.add_typer(research_app, name="research")
+
+RESEARCH_START = "2018-01-01"
+
+
+def _research_indexes(index: str) -> tuple[str, ...]:
+    if index == "all":
+        return ("hs300", "zz500")
+    if index not in ("hs300", "zz500"):
+        _fail(f"--index 只能是 all / hs300 / zz500: {index}")
+    return (index,)
+
+
+@research_app.command("sync")
+def research_sync(
+    home: HomeOption = None,
+    start: Annotated[str, typer.Option("--start", help="研究起点 YYYY-MM-DD")] = RESEARCH_START,
+    end: Annotated[str | None, typer.Option("--end", help="YYYY-MM-DD")] = None,
+    full: Annotated[bool, typer.Option("--full", help="重拉完整历史")] = False,
+    index: Annotated[str, typer.Option("--index", help="all / hs300 / zz500")] = "all",
+    source: Annotated[
+        str, typer.Option("--source", help="baostock（全字段，慢）/ fast（新浪+东财，并发）")
+    ] = "baostock",
+    workers: Annotated[int, typer.Option("--workers", help="fast 模式并发数")] = 4,
+) -> None:
+    """同步沪深300+中证500 历史成分与成分股日线/估值。
+
+    fast 模式不访问 baostock：给全部标的刷新东财估值，并用新浪补齐缺失的日线；
+    新浪没有的（已退市）留给 baostock 模式。
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from datetime import timedelta
+
+    import pandas as pd
+
+    from tradecompass.research import data as rdata
+
+    try:
+        cfg = load_config(resolve_home(home))
+    except ConfigError as exc:
+        _fail(str(exc))
+        return
+    configure_logging(log_dir=cfg.paths.logs)
+    start_date = pd.Timestamp(start).date()
+    end_date = pd.Timestamp(end).date() if end else date.today()
+    bars_start = start_date - timedelta(days=400)
+
+    try:
+        if source == "fast":
+            members = rdata.load_constituents(cfg.paths)
+        else:
+            members = rdata.sync_constituents(cfg.paths, start_date, end_date)
+            rdata.sync_industry(cfg.paths)
+    except SourceError as exc:
+        _fail(str(exc), code=3)
+        return
+    if members.empty:
+        _fail("没有成分快照，先用 baostock 模式跑一次", code=3)
+        return
+    codes = sorted(set(members["code"]))
+    console.print(f"成分快照 {members['date'].nunique()} 个月末，去重后 {len(codes)} 只")
+    # 沪深300 历史成分优先，中途停掉也能先用 --index hs300 做研究
+    hs300 = set(members.loc[members["index"] == "hs300", "code"])
+    codes.sort(key=lambda code: (code not in hs300, code))
+    if index != "all":
+        chosen = set(members.loc[members["index"] == index, "code"])
+        codes = [code for code in codes if code in chosen]
+    if source == "fast" and index == "zz500":
+        # 沪深300 成分交给 baostock，避免两个进程写同一文件
+        codes = [code for code in codes if code not in hs300]
+
+    failures: list[str] = []
+    if source == "fast":
+        filled = 0
+        # akshare 解析新浪用的 V8（py_mini_racer）不是线程安全的，只能多进程
+        with ProcessPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = {pool.submit(rdata.sync_fast, cfg.paths, c, bars_start): c for c in codes}
+            for number, future in enumerate(as_completed(futures), start=1):
+                try:
+                    filled += future.result() == "bars"
+                except (SourceError, OSError) as exc:
+                    failures.append(f"{futures[future]}: {exc}")
+                if number % 100 == 0 or number == len(codes):
+                    console.print(
+                        f"  估值 {number}/{len(codes)}，新浪补日线 {filled}，失败 {len(failures)}"
+                    )
+        for item in failures[:20]:
+            console.print("  ✗ " + escape(item), style="red")
+        return
+
+    for code in rdata.BENCHMARKS.values():
+        try:
+            rdata.sync_index_bars(cfg.paths, code, bars_start, end_date, full=full)
+        except SourceError as exc:
+            failures.append(f"{code}: {exc}")
+    for number, code in enumerate(codes, start=1):
+        try:
+            rdata.sync_stock_bars(cfg.paths, code, bars_start, end_date, full=full)
+        except (SourceError, OSError) as exc:
+            failures.append(f"{code}: {exc}")
+        if number % 100 == 0 or number == len(codes):
+            console.print(f"  日线 {number}/{len(codes)}，失败 {len(failures)}")
+    for item in failures[:20]:
+        console.print("  ✗ " + escape(item), style="red")
+    if failures:
+        raise typer.Exit(code=3)
+
+
+@research_app.command("ic")
+def research_ic(
+    home: HomeOption = None,
+    start: Annotated[str, typer.Option("--start", help="评估起点 YYYY-MM-DD")] = "2019-01-01",
+    end: Annotated[str | None, typer.Option("--end", help="YYYY-MM-DD")] = None,
+    only: Annotated[str | None, typer.Option("--only", help="只评估这些因子，逗号分隔")] = None,
+    events: Annotated[
+        bool, typer.Option("--events/--no-events", help="同时做 B1/B2 事件研究")
+    ] = True,
+    index: Annotated[str, typer.Option("--index", help="all / hs300 / zz500")] = "all",
+) -> None:
+    """横截面因子体检（RankIC/分组超额）+ 现有买点事件研究，写入 reports/research/。"""
+    import pandas as pd
+
+    from tradecompass.research.evaluate import evaluate_all, render_ic_markdown
+    from tradecompass.research.events import render_events_markdown, run_events
+    from tradecompass.research.factors import FACTORS
+    from tradecompass.research.panel import load_panel
+
+    try:
+        cfg = load_config(resolve_home(home))
+    except ConfigError as exc:
+        _fail(str(exc))
+        return
+    start_date = pd.Timestamp(start).date()
+    end_date = pd.Timestamp(end).date() if end else date.today()
+    specs = FACTORS
+    if only:
+        wanted = {item.strip() for item in only.split(",") if item.strip()}
+        specs = tuple(spec for spec in FACTORS if spec.name in wanted)
+        if not specs:
+            _fail(f"--only 没有匹配到因子: {sorted(wanted)}")
+            return
+    try:
+        panel = load_panel(cfg.paths, indexes=_research_indexes(index))
+        results = evaluate_all(panel, specs, start_date, end_date)
+    except ValueError as exc:
+        _fail(str(exc), code=3)
+        return
+    console.print(
+        f"面板 {len(panel.dates)} 日 × {len(panel.codes)} 只；评估 {start_date} → {end_date}"
+    )
+    table = Table(show_header=True, header_style="bold")
+    for column in ("因子", "RankIC", "t", "IC>0", "中性IC", "多头超额", "多空", "换手"):
+        table.add_column(column, justify="right" if column != "因子" else "left")
+    for r in sorted(results, key=lambda x: -abs(x.t_stat)):
+        neutral = r.ic_neutral.mean() if not r.ic_neutral.empty else float("nan")
+        table.add_row(
+            r.spec.name, f"{r.ic_mean:+.3f}", f"{r.t_stat:+.1f}", f"{r.positive_rate:.0%}",
+            f"{neutral:+.3f}", f"{r.long_excess:+.1%}", f"{r.long_short:+.1%}",
+            f"{r.long_turnover:.0%}",
+        )
+    console.print(table)
+    directory = cfg.paths.reports / "research"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"factor_ic-{end_date}.md"
+    path.write_text(render_ic_markdown(results, start_date, end_date), encoding="utf-8")
+    console.print(f"报告：{escape(str(path))}")
+
+    if not events:
+        return
+    event_results = run_events(panel, start_date, end_date)
+    for item in event_results:
+        mean, _, hit, t = item.stats.get(20, (float("nan"),) * 4)
+        console.print(
+            f"{item.label}: {item.count} 次，20日超额 {mean:+.2%}，胜率 {hit:.0%}，t {t:+.1f}"
+        )
+    path = directory / f"events-{end_date}.md"
+    path.write_text(render_events_markdown(event_results, start_date, end_date), encoding="utf-8")
+    console.print(f"报告：{escape(str(path))}")
+
+
+@research_app.command("portfolio")
+def research_portfolio(
+    factors: Annotated[str, typer.Option("--factors", help="因子名，逗号分隔（按文献方向合成）")],
+    home: HomeOption = None,
+    start: Annotated[str, typer.Option("--start", help="YYYY-MM-DD")] = "2019-01-01",
+    end: Annotated[str | None, typer.Option("--end", help="YYYY-MM-DD")] = None,
+    top: Annotated[int, typer.Option("--top", help="持仓只数")] = 10,
+    buffer: Annotated[float, typer.Option("--buffer", help="持有缓冲倍数")] = 2.0,
+    tag: Annotated[str, typer.Option("--tag", help="报告文件名标签")] = "portfolio",
+    index: Annotated[str, typer.Option("--index", help="all / hs300 / zz500")] = "all",
+    max_per_industry: Annotated[
+        int, typer.Option("--max-per-industry", help="单一行业最多几只，0 不限")
+    ] = 3,
+) -> None:
+    """月度调仓多因子组合回测（扣成本），对比沪深300/中证500/股票池等权。"""
+    import pandas as pd
+
+    from tradecompass.research.data import load_industry
+    from tradecompass.research.factors import factor_by_name
+    from tradecompass.research.panel import load_panel
+    from tradecompass.research.portfolio import (
+        PortfolioResult,
+        latest_picks,
+        load_benchmarks,
+        render_portfolio_markdown,
+        run_portfolio,
+    )
+
+    try:
+        cfg = load_config(resolve_home(home))
+    except ConfigError as exc:
+        _fail(str(exc))
+        return
+    try:
+        specs = tuple(factor_by_name(name.strip()) for name in factors.split(",") if name.strip())
+    except KeyError as exc:
+        _fail(f"未知因子: {exc}")
+        return
+    start_date = pd.Timestamp(start).date()
+    end_date = pd.Timestamp(end).date() if end else date.today()
+    industry = load_industry(cfg.paths)
+    cap = max_per_industry if max_per_industry > 0 else None
+    try:
+        panel = load_panel(cfg.paths, indexes=_research_indexes(index))
+        result = run_portfolio(
+            panel, specs, start_date, end_date, top=top, buffer=buffer,
+            benchmark_bars=load_benchmarks(cfg.paths), industry=industry, max_per_industry=cap,
+        )
+    except ValueError as exc:
+        _fail(str(exc), code=3)
+        return
+    table = Table(show_header=True, header_style="bold")
+    for column in ("序列", "总收益", "年化", "夏普", "最大回撤"):
+        table.add_column(column, justify="right" if column != "序列" else "left")
+    for name, values in {"组合（扣成本）": result.returns, **result.benchmarks}.items():
+        s = PortfolioResult.stats(values.dropna())
+        table.add_row(
+            name, f"{s['total']:+.1%}", f"{s['annual']:+.1%}", f"{s['sharpe']:.2f}",
+            f"{s['max_dd']:.1%}",
+        )
+    console.print(table)
+    picks = latest_picks(panel, specs, top, industry, cap)
+    labels = [f"{code}({industry.get(code, '?')[:6]})" for code in picks]
+    console.print(f"最新打分（{panel.dates[-1].date()} 收盘）前 {top}：" + "、".join(labels))
+    directory = cfg.paths.reports / "research"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{tag}-{end_date}.md"
+    text = render_portfolio_markdown(result, specs, start_date, end_date, top)
+    text += f"\n最新打分（{panel.dates[-1].date()} 收盘）前 {top}：" + "、".join(labels) + "\n"
+    path.write_text(text, encoding="utf-8")
+    console.print(f"报告：{escape(str(path))}")
+
+
+@research_app.command("rolling")
+def research_rolling(
+    home: HomeOption = None,
+    start: Annotated[str, typer.Option("--start", help="YYYY-MM-DD")] = "2019-01-01",
+    end: Annotated[str | None, typer.Option("--end", help="YYYY-MM-DD")] = None,
+    capital: Annotated[float, typer.Option("--capital", help="个股部分资金")] = 100_000.0,
+    slots: Annotated[int, typer.Option("--slots", help="持仓名额")] = 12,
+    holdout: Annotated[str, typer.Option("--holdout", help="样本外起点")] = "2023-01-01",
+    tag: Annotated[str, typer.Option("--tag", help="报告文件名标签")] = "rolling",
+    tilt: Annotated[
+        bool, typer.Option("--tilt/--no-tilt", help="板块组趋势倾斜（MA120 上×1.3、下×0.7）")
+    ] = True,
+) -> None:
+    """分板块滚动决策回测：逐日重放“数据 + 交易记录 + 持仓 → 决策”。"""
+    import pandas as pd
+
+    from tradecompass.research.data import load_industry
+    from tradecompass.research.panel import load_panel
+    from tradecompass.research.portfolio import load_benchmarks
+    from tradecompass.research.rolling import (
+        RollingEngine,
+        group_indices,
+        render_rolling_markdown,
+        run_rolling,
+        summarize,
+        trend_tilt,
+    )
+
+    try:
+        cfg = load_config(resolve_home(home))
+    except ConfigError as exc:
+        _fail(str(exc))
+        return
+    start_date = pd.Timestamp(start).date()
+    end_date = pd.Timestamp(end).date() if end else date.today()
+    industry = load_industry(cfg.paths)
+    if not industry:
+        _fail("缺少行业分类，先运行 research sync（baostock 模式）", code=3)
+        return
+    try:
+        panel = load_panel(cfg.paths)
+        engine = RollingEngine(panel, industry, cfg.backtest.costs, slots=slots)
+        if tilt:
+            engine.set_tilt(trend_tilt(group_indices(engine)))
+        result = run_rolling(
+            engine, start_date, end_date, capital=capital,
+            benchmark_bars=load_benchmarks(cfg.paths),
+        )
+    except ValueError as exc:
+        _fail(str(exc), code=3)
+        return
+    table = Table(show_header=True, header_style="bold")
+    for column in ("序列", "总收益", "年化", "夏普", "最大回撤"):
+        table.add_column(column, justify="right" if column != "序列" else "left")
+    for name, values in {"策略（扣成本）": result.equity, **result.benchmarks}.items():
+        s = summarize(values.dropna())
+        table.add_row(
+            name, f"{s['total']:+.1%}", f"{s['annual']:+.1%}", f"{s['sharpe']:.2f}",
+            f"{s['max_dd']:.1%}",
+        )
+    console.print(table)
+    directory = cfg.paths.reports / "research"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{tag}-{end_date}.md"
+    holdout_date = pd.Timestamp(holdout).date()
+    path.write_text(
+        render_rolling_markdown(result, engine, start_date, end_date, holdout_date),
+        encoding="utf-8",
+    )
+    console.print(f"报告：{escape(str(path))}")
+
+
+@app.command("plan")
+def weekly_plan(
+    home: HomeOption = None,
+    max_new_buys: Annotated[int, typer.Option("--max-new-buys", help="每个交易日最多新买几只")] = 3,
+    slots: Annotated[int, typer.Option("--slots", help="个股名额")] = 12,
+) -> None:
+    """收盘后生成下一交易日操作提醒（真实持仓 + 交易记录 + 滚动策略），只写文件不推送。"""
+    import dataclasses
+    import json
+
+    import pandas as pd
+    import yaml
+
+    from tradecompass.account.behavior import analyze
+    from tradecompass.market.regime import build_series
+    from tradecompass.research import data as rdata
+    from tradecompass.research.etfs import ETFS
+    from tradecompass.research.panel import load_panel
+    from tradecompass.research.rolling import RollingEngine, group_indices, trend_tilt
+    from tradecompass.research.weekly_plan import (
+        base_targets_from_universe,
+        build_plan,
+        render_plan,
+    )
+
+    try:
+        cfg = load_config(resolve_home(home))
+    except ConfigError as exc:
+        _fail(str(exc))
+        return
+    folder = cfg.paths.home / "portfolio" / "eastmoney"
+    snapshots = sorted(folder.glob("holdings_*.csv"))
+    accounts = sorted(folder.glob("account_*.yaml"))
+    if not snapshots or not accounts:
+        _fail("缺少对账单数据，先运行 tradecompass import-statement <pdf>", code=3)
+        return
+    holdings = pd.read_csv(snapshots[-1], dtype={"code": str})
+    account = yaml.safe_load(accounts[-1].read_text(encoding="utf-8"))
+    trades = pd.read_csv(folder / "trades.csv", dtype={"code": str})
+    summary = account["summary"]
+
+    panel = load_panel(cfg.paths)
+    engine = RollingEngine(panel, rdata.load_industry(cfg.paths), cfg.backtest.costs, slots=slots)
+    engine.set_tilt(trend_tilt(group_indices(engine)))
+    as_of = panel.dates[-1].date()
+    names = _stock_names(cfg.paths.data / "research" / "names.parquet")
+    etf_codes = [e.code for e in ETFS]
+    base = base_targets_from_universe(cfg.paths.config / "universe.yaml")
+    state_path = cfg.paths.home / "portfolio" / "plan_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    plan = build_plan(
+        engine, holdings, trades,
+        cash=float(summary["资金可用"]), total_assets=float(summary["总资产"]),
+        base_targets=base,
+        etf_bars={c: rdata.read_etf_bars(cfg.paths, c) for c in etf_codes},
+        etf_names={e.code: e.name for e in ETFS},
+        names=names, max_new_buys=max_new_buys,
+        cleanup_since=state.get("cleanup_since", {}),
+    )
+
+    hs300 = rdata.read_index_bars(cfg.paths, rdata.BENCHMARKS["hs300"])
+    points = build_series(hs300) if not hs300.empty else []
+    market = (
+        f"沪深300 状态机：{points[-1].state.value}（{points[-1].day}），仅作参考——"
+        "回测显示按它调总仓位会追涨杀跌，本系统不据此加减仓"
+        if points
+        else "沪深300 数据缺失"
+    )
+
+    report = analyze(trades)
+    closed = pd.DataFrame([dataclasses.asdict(c) for c in report.closed])
+    behavior = [
+        f"两年成交 {report.trades} 笔（买 {report.buys} / 卖 {report.sells}），"
+        f"涉及 {report.symbols_traded} 个标的；"
+        f"同一天买卖同一标的 {report.same_day_round_trips} 次；费用合计 {report.fees:,.0f} 元。",
+        f"银行累计转入 {account['totals']['bank_in']:,.0f} 元、未转出；分红净额 "
+        f"{account['totals']['dividend_net']:,.0f} 元。",
+    ]
+    if not closed.empty:
+        wins, losses = closed[closed.pnl > 0], closed[closed.pnl < 0]
+        behavior.append(
+            f"区间内已平仓 {len(closed)} 笔，已实现 {report.realized:+,.0f} 元；胜率 "
+            f"{(closed.pnl > 0).mean():.0%}，平均盈利 {wins.pnl.mean():+,.0f} 元、"
+            f"平均亏损 {losses.pnl.mean():+,.0f} 元（盈亏比 "
+            f"{abs(wins.pnl.mean() / losses.pnl.mean()):.2f}）。"
+        )
+        busiest = trades.groupby("code").size().sort_values(ascending=False)
+        top_code = str(busiest.index[0])
+        top_pnl = closed[closed.code == top_code.zfill(6)].pnl.sum()
+        top_name = trades.loc[trades.code == top_code, "name"].iloc[-1]
+        behavior.append(
+            f"成交最频繁的是 {top_name}（{int(busiest.iloc[0])} 笔），"
+            f"区间已实现 {top_pnl:+,.0f} 元。"
+        )
+    views = plan["views"]
+    deep = [v for v in views if v.pnl_pct <= -0.20]  # type: ignore[attr-defined]
+    if deep:
+        loss = sum((v.price - v.cost) * v.quantity for v in deep)
+        behavior.append(
+            f"当前浮亏超过 20% 的持仓 {len(deep)} 只，合计浮亏 {loss:,.0f} 元；"
+            "规则：买入只来自策略排名，卖出只来自排名到期或清理条件单，不补仓摊低。"
+        )
+
+    notes = []
+    for code, diff in account.get("reconcile_opening_or_unlisted", {}).items():
+        held = int(holdings.loc[holdings.code == code, "quantity"].sum())
+        if diff < 0:
+            notes.append(
+                f"{code}：流水推算应为 {held - diff} 份，持仓快照为 {held} 份——"
+                "对账单最后一天的成交可能未进流水，请在 APP 核对；本报告以快照为准。"
+            )
+        else:
+            notes.append(f"{code}：有 {diff} 份为对账单区间之前的持仓，已实现盈亏未含这部分。")
+    if plan["etf_stale"]:
+        notes.append(
+            "、".join(plan["etf_stale"])  # type: ignore[arg-type]
+            + f" 缺 {as_of} 的 K 线，均线按上一交易日计算；现价用对账单价。"
+        )
+    notes += [
+        "策略研究结论（2026-10-23 回测，2019–2026）：年化约 8.6%、最大回撤约 −18%，优势是回撤小；"
+        "牛市会跑输，样本外仍需实盘验证。不要因为短期表现改规则。",
+        "每个交易日收盘后更新数据并重跑：tradecompass plan；有成交就重新导入对账单（或更新持仓）。",
+    ]
+    state_path.write_text(
+        json.dumps({"as_of": str(as_of), "cleanup_since": plan["cleanup_state"]},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    from datetime import timedelta
+
+    from tradecompass.data.calendar import default_calendar
+
+    # next_trading_day 含当日，所以从次日开始找
+    next_day = default_calendar().next_trading_day(as_of + timedelta(days=1))
+    text = render_plan(
+        plan, base_targets=base, behavior_lines=behavior, market_line=market, notes=notes,
+        max_new_buys=max_new_buys, next_day=next_day,
+    )
+    directory = cfg.paths.reports / "plan"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{next_day}.md"
+    path.write_text(text, encoding="utf-8")
+    console.print(f"数据截至 {as_of}，适用 {next_day}；报告：{escape(str(path))}")
+
+
+def _stock_names(cache: Path) -> dict[str, str]:
+    import pandas as pd
+
+    if cache.exists():
+        frame = pd.read_parquet(cache)
+    else:
+        try:
+            import akshare as ak
+
+            frame = ak.stock_info_a_code_name()
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            frame.to_parquet(cache)
+        except Exception:  # noqa: BLE001 - 名称只用于展示，取不到就显示代码
+            return {}
+    return dict(zip(frame["code"].astype(str), frame["name"].astype(str), strict=True))
