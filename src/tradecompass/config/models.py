@@ -180,23 +180,30 @@ class UniverseConfig(_Base):
 
     @model_validator(mode="after")
     def _v_targets(self) -> UniverseConfig:
+        """base_etf 的 target 是底仓内部比例（和为 1），steady_etf 是占总资产比例。"""
         base = [i for i in self.instruments if i.kind == "base_etf"]
+        steady = [i for i in self.instruments if i.kind == "steady_etf"]
         for inst in self.instruments:
-            if inst.kind == "base_etf":
+            if inst.kind in ("base_etf", "steady_etf"):
                 if inst.target is None:
-                    raise ValueError(f"{inst.symbol} 是 base_etf，必须设置 target")
+                    raise ValueError(f"{inst.symbol} 是 {inst.kind}，必须设置 target")
                 if not 0 < inst.target <= 1:
                     raise ValueError(
                         f"{inst.symbol} 的 target 必须在 (0, 1] 内，收到 {inst.target}"
                     )
             elif inst.target is not None:
                 raise ValueError(
-                    f"{inst.symbol} 的 kind 是 {inst.kind}，不得设置 target（只有 base_etf 能设置）"
+                    f"{inst.symbol} 的 kind 是 {inst.kind}，不得设置 target"
+                    "（只有 base_etf / steady_etf 能设置）"
                 )
         if base:
             total = sum(i.target or 0.0 for i in base)
             if abs(total - 1.0) > 1e-6:
                 raise ValueError(f"base_etf 的 target 之和必须为 1.0，当前为 {total:.6f}")
+        if steady:
+            total = sum(i.target or 0.0 for i in steady)
+            if total > 1.0 + 1e-6:
+                raise ValueError(f"steady_etf 的 target 之和不能超过 1.0，当前为 {total:.6f}")
         return self
 
 
@@ -318,7 +325,7 @@ class CostsConfig(_Base):
     slippage: float = Field(default=0.001, ge=0.0, le=0.05)
 
     def _is_fund(self, kind: str) -> bool:
-        return kind in ("base_etf", "sector_etf")
+        return kind in ("base_etf", "steady_etf", "sector_etf")
 
     def commission_for(self, kind: str) -> float:
         """按标的类型取佣金费率。"""

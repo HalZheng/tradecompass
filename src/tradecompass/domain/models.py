@@ -11,7 +11,7 @@ from datetime import date
 from typing import Literal
 
 Market = Literal["SH", "SZ", "BJ"]
-Kind = Literal["stock", "sector_etf", "base_etf", "index"]
+Kind = Literal["stock", "sector_etf", "base_etf", "steady_etf", "index"]
 Board = Literal["main", "gem", "star", "bj", "etf", "index"]
 Category = Literal["base", "swing", "legacy"]
 ExitReason = Literal["stop", "trail_ma", "trail_atr", "time", "cleanup", "rebalance"]

@@ -152,6 +152,33 @@ def test_base_etf_requires_target(home: Path) -> None:
     assert "必须设置 target" in str(exc.value)
 
 
+def test_steady_etf_requires_target_and_accepts_it(home: Path) -> None:
+    """稳健 ETF 的目标是“占总资产”的比例，必须显式配置，不能静默当 0。"""
+    _write(
+        home,
+        "universe.yaml",
+        """
+        instruments:
+          - {symbol: "510300", market: SH, name: A, kind: base_etf, target: 1.0}
+          - {symbol: "159201", market: SZ, name: B, kind: steady_etf}
+        """,
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_config(home)
+    assert "steady_etf，必须设置 target" in str(exc.value)
+
+    _write(
+        home,
+        "universe.yaml",
+        """
+        instruments:
+          - {symbol: "510300", market: SH, name: A, kind: base_etf, target: 1.0}
+          - {symbol: "159201", market: SZ, name: B, kind: steady_etf, target: 0.04}
+        """,
+    )
+    assert load_config(home).universe.instruments[1].target == 0.04
+
+
 def test_duplicate_symbol_is_rejected(home: Path) -> None:
     _write(
         home,

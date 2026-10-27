@@ -58,7 +58,9 @@ def fetch(query: BarQuery, adjust: str = "none") -> pd.DataFrame:
             raw = ak.index_zh_a_hist(
                 symbol=query.symbol, period="daily", start_date=start, end_date=end
             )
-        elif query.kind in ("base_etf", "sector_etf") or is_fund_code(query.symbol):
+        elif query.kind in ("base_etf", "steady_etf", "sector_etf") or is_fund_code(
+            query.symbol
+        ):
             raw = ak.fund_etf_hist_em(
                 symbol=query.symbol, period="daily", start_date=start, end_date=end, adjust=aj
             )

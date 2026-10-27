@@ -39,6 +39,9 @@ COOLDOWN_TRADING_DAYS = 20
 CLEANUP_PATIENCE = 10
 DEEP_LOSS = -0.20
 BASE_SHARE_OF_ASSETS = 0.5
+"""底仓上限（占总资产）；每只再乘自己的仓位带，所以实际目标通常低于 50%。"""
+STOCK_SHARE_OF_ASSETS = 0.4
+"""个股资金占总资产的比例；底仓 50% + 稳健 10% + 个股 40% = 100%。"""
 BASE_BUDGET_UNIT = 10_000.0
 BASE_REBALANCE_SHARE = 0.5
 """清理回笼资金里用于补底仓的比例；HANDOFF §4：回笼资金一半按差额补。"""
@@ -80,6 +83,12 @@ class HoldingView:
     """建议仓位系数（相对目标仓位），如 0.5/0.75/1.0/0.6；不是总资产比例。"""
     etf_band_action: str = ""
     """仓位带动作：高位减半、低位止跌加回、等止跌等。只建议，不自动下单。"""
+    etf_target_value: float | None = None
+    """稳健 ETF 的目标市值（总资产 × 配置目标 × 仓位带）；没有配置目标的是 None。"""
+    etf_gap: float | None = None
+    """目标市值 - 现有市值；正数要加、负数要减。"""
+    etf_order: str = ""
+    """按整手给出的买卖建议，如“加 800 份”“减 3,800 份”；只建议，不自动下单。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,6 +313,29 @@ def etf_action(
     return action, "波段 ETF 跌破 MA20（暂行规则）；" + detail
 
 
+def _etf_target_order(
+    target_value: float, value: float, price: float, quantity: int
+) -> tuple[float, float, str]:
+    """把稳健 ETF 的目标缺口翻成整手买卖建议；只建议，不自动下单。
+
+    减仓不超过现有份额；差不到一手时不动，避免为了凑目标反复交易。
+    """
+    gap = target_value - value
+    if price <= 0:
+        return target_value, gap, "缺价格，暂不能下单"
+    lots = int(abs(gap) // (price * LOT)) * LOT
+    if gap > 0:
+        if lots > 0:
+            return target_value, gap, f"加 {lots:,} 份（约 {lots * price:,.0f} 元）"
+        return target_value, gap, "差不足一手，攒够再加"
+    if gap < 0:
+        lots = min(lots, quantity)
+        if lots > 0:
+            return target_value, gap, f"减 {lots:,} 份（约 {lots * price:,.0f} 元）"
+        return target_value, gap, "超配不足一手，暂不动"
+    return target_value, gap, "已在目标"
+
+
 def _half_lot(quantity: int) -> int:
     if quantity < 2 * LOT:
         return quantity
@@ -345,6 +377,7 @@ class BaseOrder:
 
     code: str
     weight: float
+    band: float
     target: float
     have: float
     gap: float
@@ -411,17 +444,20 @@ def base_orders(
     views: list[HoldingView],
     etf_bars: dict[str, pd.DataFrame],
     cash_now: float,
+    band_multipliers: dict[str, float] | None = None,
 ) -> list[BaseOrder]:
     """按缺口比例把“现在的闲钱”和“每回笼一万元”分到三只底仓 ETF。
 
-    分配只按缺口比例，不猜哪只更好；买入数量取整到 100 份，限价 = 收盘 × 1.02。
-    现金不够一手时给 0，报告里会说明要攒几次。
+    底仓目标是“50% 上限 × 底仓内比例 × 仓位带”：高位减、低位止跌前不加回，
+    所以实际目标会低于 50%。分配只按缺口比例，不猜哪只更好；买入数量取整到
+    100 份，限价 = 收盘 × 1.02。现金不够一手时给 0，报告里会说明要攒几次。
     """
+    bands = band_multipliers or {}
     have = {
         code: sum(v.value for v in views if v.code == code) for code in base_targets
     }
     target = {
-        code: total_assets * BASE_SHARE_OF_ASSETS * weight
+        code: total_assets * BASE_SHARE_OF_ASSETS * weight * bands.get(code, 1.0)
         for code, weight in base_targets.items()
     }
     gap = {code: max(0.0, target[code] - have[code]) for code in base_targets}
@@ -455,6 +491,7 @@ def base_orders(
             BaseOrder(
                 code=code,
                 weight=weight,
+                band=bands.get(code, 1.0),
                 target=target[code],
                 have=have[code],
                 gap=gap[code],
@@ -489,7 +526,8 @@ def build_plan(
     etf_names: dict[str, str],
     names: dict[str, str],
     etf_roles: dict[str, str] | None = None,
-    stock_share: float = 0.5,
+    steady_targets: dict[str, float] | None = None,
+    stock_share: float = STOCK_SHARE_OF_ASSETS,
     max_new_buys: int = 3,
     cleanup_since: dict[str, str] | None = None,
     watchlist: Sequence[str] = (),
@@ -498,6 +536,7 @@ def build_plan(
     i = len(engine.dates) - 1
     as_of = engine.dates[i]
     etf_infos = etf_by_code()
+    steady = steady_targets or {}
     stock_capital = total_assets * stock_share
     slot_value = stock_capital / engine.slots
     slots = engine.rule_slots(i)
@@ -597,12 +636,26 @@ def build_plan(
             band_data = _etf_position_band(bars, strategy)
             if band_data is not None:
                 etf_position, _stabilized, etf_band, band_action = band_data
+            etf_target_value = etf_gap = None
+            etf_order = ""
+            if code in steady:
+                band = 1.0 if etf_band is None else etf_band
+                target_value = total_assets * steady[code] * band
+                etf_target_value, etf_gap, etf_order = _etf_target_order(
+                    target_value, value, price, qty
+                )
+                detail = (
+                    f"目标 {etf_target_value:,.0f} 元（{steady[code]:.0%} × 系数 {band:.0%}）、"
+                    f"现 {value:,.0f} 元；{etf_order}。" + detail
+                )
             group = "底仓" if code in base_targets else f"ETF·{role}"
             views.append(HoldingView(code, name_, "ETF", qty, price, cost, value,
                                      pnl, group, None, None, ma10, ma20, ma60, action, detail,
                                      strength=strength, asset_class=asset_class,
                                      strategy=strategy, etf_position=etf_position,
-                                     etf_band=etf_band, etf_band_action=band_action))
+                                     etf_band=etf_band, etf_band_action=band_action,
+                                     etf_target_value=etf_target_value, etf_gap=etf_gap,
+                                     etf_order=etf_order))
             continue
         j = engine.col.get(bs)
         ma10 = ma20 = ma60 = None
@@ -815,6 +868,8 @@ def build_plan(
         "universe_size": {name: int(len(ranked)) for name, ranked in ranked_by_rule.items()},
         "slot_value": slot_value,
         "stock_capital": stock_capital,
+        "stock_share": stock_share,
+        "steady_targets": dict(steady),
         "cash": cash,
         "spent_on_topup": spent_on_topup,
         "total_assets": total_assets,
@@ -826,6 +881,11 @@ def build_plan(
             views=views,
             etf_bars=etf_bars,
             cash_now=cash - spent_on_topup - spent_on_stocks,
+            band_multipliers={
+                v.code: v.etf_band
+                for v in views
+                if v.code in base_targets and v.etf_band is not None
+            },
         ),
         "etf_stale": etf_stale,
     }
@@ -883,6 +943,11 @@ def plan_payload(
             "etf_position": None if v.etf_position is None else round(v.etf_position, 1),
             "etf_band": None if v.etf_band is None else round(v.etf_band, 2),
             "etf_band_action": v.etf_band_action,
+            "etf_target_value": (
+                None if v.etf_target_value is None else round(v.etf_target_value, 2)
+            ),
+            "etf_gap": None if v.etf_gap is None else round(v.etf_gap, 2),
+            "etf_order": v.etf_order,
             "add_shares": v.add_shares,
             "drivers": v.drivers,
         }
@@ -943,6 +1008,16 @@ def plan_payload(
             "cash": round(float(plan["cash"]), 2),  # type: ignore[arg-type]
             "stock_capital": round(float(plan["stock_capital"]), 2),  # type: ignore[arg-type]
             "slot_value": round(float(plan["slot_value"]), 2),  # type: ignore[arg-type]
+            "allocation": {
+                "base": BASE_SHARE_OF_ASSETS,
+                "steady": round(
+                    sum(cast("dict[str, float]", plan.get("steady_targets") or {}).values()),
+                    4,
+                ),
+                "stock": round(
+                    float(plan.get("stock_share", STOCK_SHARE_OF_ASSETS)), 4  # type: ignore[arg-type]
+                ),
+            },
         },
         "holdings": holdings,
         "buys": buys,
@@ -969,6 +1044,17 @@ def render_plan(
     total = float(plan["total_assets"])  # type: ignore[arg-type]
     cash = float(plan["cash"])  # type: ignore[arg-type]
     as_of: date = plan["as_of"]  # type: ignore[assignment]
+    stock_share = float(plan.get("stock_share", STOCK_SHARE_OF_ASSETS))  # type: ignore[arg-type]
+    steady_targets = cast("dict[str, float]", plan.get("steady_targets") or {})
+    steady_share = sum(steady_targets.values())
+    raw_orders = cast("list[BaseOrder]", plan.get("base_orders") or [])
+    base_target_value = sum(entry.target for entry in raw_orders)
+    if not raw_orders:
+        base_target_value = total * BASE_SHARE_OF_ASSETS
+    bands_by_code = {v.code: v.etf_band for v in views if v.etf_band is not None}
+    steady_target_value = total * sum(
+        weight * bands_by_code.get(code, 1.0) for code, weight in steady_targets.items()
+    )
     period_start, period_end = statement_period or (as_of, as_of)
     stock_value = sum(v.value for v in views if v.kind == "股票")
     etf_value = sum(v.value for v in views if v.kind == "ETF")
@@ -1018,25 +1104,32 @@ def render_plan(
             else f"（还差 {max_new_buys - actual_buys} 只的钱）"
         )
         + "；清理回笼的钱由之后每天的报告继续安排。",
-        f"- 底仓 {base_value / total:.0%}（目标 {BASE_SHARE_OF_ASSETS:.0%}）"
+        f"- 目标结构：底仓 {BASE_SHARE_OF_ASSETS:.0%} 上限"
+        f"（按仓位带后 {base_target_value / total:.0%}）"
+        f" + 稳健 ETF {steady_share:.0%} 上限（按仓位带后 {steady_target_value / total:.0%}）"
+        f" + 个股 {stock_share:.0%}；"
+        f"底仓现 {base_value / total:.0%}、稳健现 {steady_value / total:.0%}"
         + (
-            "，清理回笼资金按差额优先补底仓"
-            if base_value < total * BASE_SHARE_OF_ASSETS
+            "，清理回笼资金按差额优先补底仓/稳健"
+            if base_value + steady_value < base_target_value + steady_target_value
             else "，已达标，回笼资金留给策略名额"
         )
-        + "；稳健类 ETF 继续持有；波段类 ETF 规则待验证，暂不新增。",
+        + "；波段类 ETF 规则待验证，暂不新增。",
         "",
         f"## 二、账户现状（对账单 {period_end:%m-%d}）",
         "",
-        "| 项目 | 金额 | 占比 |",
-        "|---|---|---|",
-        f"| 总资产 | {total:,.0f} | 100% |",
-        f"| 个股市值 | {stock_value:,.0f} | {stock_value / total:.0%} |",
-        f"| ETF 市值 | {etf_value:,.0f} | {etf_value / total:.0%} |",
-        f"| 其中底仓 ETF | {base_value:,.0f} | {base_value / total:.0%}（目标 50%） |",
-        f"| 其中稳健 ETF | {steady_value:,.0f} | {steady_value / total:.0%} |",
-        f"| 其中波段 ETF | {swing_value:,.0f} | {swing_value / total:.0%} |",
-        f"| 可用现金（含天天宝） | {cash:,.0f} | {cash / total:.0%} |",
+        "| 项目 | 金额 | 占比 | 目标 |",
+        "|---|---|---|---|",
+        f"| 总资产 | {total:,.0f} | 100% | - |",
+        f"| 个股市值 | {stock_value:,.0f} | {stock_value / total:.0%} | {stock_share:.0%} |",
+        f"| ETF 市值 | {etf_value:,.0f} | {etf_value / total:.0%} | "
+        f"{BASE_SHARE_OF_ASSETS + steady_share:.0%} 上限 |",
+        f"| 其中底仓 ETF | {base_value:,.0f} | {base_value / total:.0%} | "
+        f"{BASE_SHARE_OF_ASSETS:.0%} 上限（按仓位带 {base_target_value / total:.0%}） |",
+        f"| 其中稳健 ETF | {steady_value:,.0f} | {steady_value / total:.0%} | "
+        f"{steady_share:.0%} 上限（按仓位带 {steady_target_value / total:.0%}） |",
+        f"| 其中波段 ETF | {swing_value:,.0f} | {swing_value / total:.0%} | 不新增 |",
+        f"| 可用现金（含天天宝） | {cash:,.0f} | {cash / total:.0%} | - |",
         "",
         f"## 三、市场与板块状态（只用截至 {as_of:%m-%d} 的数据）",
         "",
@@ -1063,7 +1156,7 @@ def render_plan(
         lines.append(f"| {name} | {detail} | {sizes.get(name, 0)} 只 |")
     lines += [
         "",
-        f"个股部分资金按总资产 50% 计约 {float(plan['stock_capital']):,.0f} 元，"  # type: ignore[arg-type]
+        f"个股部分资金按总资产 {stock_share:.0%} 计约 {float(plan['stock_capital']):,.0f} 元，"  # type: ignore[arg-type]
         f"每个名额约 {float(plan['slot_value']):,.0f} 元。",  # type: ignore[arg-type]
         "",
         "## 四、持仓逐只处理",
@@ -1096,24 +1189,30 @@ def render_plan(
             "",
             "## 四之二、ETF 仓位带（只建议，不自动下单）",
             "",
-            "| 代码 | 名称 | 资产类别 | 角色 | 现价 | 250日位置 | 策略 | 建议系数 | 动作 |",
-            "|---|---|---|---|---|---|---|---|---|",
+            "| 代码 | 名称 | 资产类别 | 角色 | 现价 | 250日位置 | 策略 | 建议系数 | "
+            "目标金额 | 现市值 | 差额 | 建议 |",
+            "|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         for v in sorted(band_rows, key=lambda x: (x.group, x.code)):
             position = "-" if v.etf_position is None else f"{v.etf_position:.0f}"
             band = "-" if v.etf_band is None else f"{v.etf_band:.0%}"
+            target = "-" if v.etf_target_value is None else f"{v.etf_target_value:,.0f}"
+            gap_text = "-" if v.etf_gap is None else f"{v.etf_gap:+,.0f}"
             lines.append(
                 f"| {v.code} | {v.name} | "
                 f"{ASSET_CLASS_LABELS.get(v.asset_class, v.asset_class or '-')} | "
                 f"{v.group.replace('ETF·', '')} | {v.price:.3f} | {position} | "
                 f"{STRATEGY_LABELS.get(v.strategy, v.strategy or '-')} | {band} | "
-                f"{v.etf_band_action or '-'} |"
+                f"{target} | {v.value:,.0f} | {gap_text} | "
+                f"{v.etf_order or v.etf_band_action or '-'} |"
             )
         lines += [
             "",
             "仓位带只用于底仓/稳健里的宽基、红利/价值、海外：高位减、低位止跌后加回，"
-            "始终保留核心；空出的钱是现金，不加杠杆。系数是“目标仓位的比例”，不是总资产比例；"
-            "底仓 50% 先按上限处理。",
+            "始终保留核心；空出的钱是现金，不加杠杆。系数是“目标仓位的比例”，不是总资产比例。"
+            "底仓 50% 是上限，每只再乘自己的系数，所以实际目标通常低于 50%。",
+            "目标金额 = 总资产 × 该 ETF 的配置目标 × 建议系数；只有 universe.yaml 里配了 "
+            "steady_etf 目标的才给金额和整手买卖建议，其他 ETF 只看系数。"
             "低位止跌 = 收盘≥MA20 或 5 日收益>0，是确认不是预测；"
             "黄金/债券只做再平衡、行业/主题仍按清理规则，都不用这张表。",
         ]
@@ -1138,7 +1237,7 @@ def render_plan(
         ),
         "",
         f"清理完成后：如果 {len(clean)} 只清理仓全部按条件单成交，回笼约 {clean_value:,.0f} 元——"
-        f"其中 {clean_value * BASE_REBALANCE_SHARE:,.0f} 元按差额补底仓，"
+        f"其中 {clean_value * BASE_REBALANCE_SHARE:,.0f} 元按差额补底仓/稳健，"
         f"剩下 {clean_value * (1 - BASE_REBALANCE_SHARE):,.0f} 元按排名重建个股；"
         f"个股持仓会从 {len(stock_now)} 只降到 {len(stock_after)} 只"
         "（这个数字是“全部成交”的上限，实际会分很多天）。",
@@ -1189,14 +1288,13 @@ def render_plan(
         "状态只看分数与可交易性，不看持有成本，也不看个人偏好。已持仓的自选票不在这里重复，"
         "见第四节持仓表。",
         "",
-        f"## 七、底仓再平衡（目标：总资产 {BASE_SHARE_OF_ASSETS:.0%}）",
+        f"## 七、底仓再平衡（目标：总资产 {BASE_SHARE_OF_ASSETS:.0%} 上限 × 仓位带）",
         "",
-        "| 代码 | 目标占底仓 | 目标金额 | 现有市值 | 差额 | 限价（≤） | "
+        "| 代码 | 目标占底仓 | 仓位带 | 目标金额 | 现有市值 | 差额 | 限价（≤） | "
         "本次可买 | 每回笼 1 万元 | 补到目标还需 |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     order_index = {code: position for position, code in enumerate(base_targets)}
-    raw_orders = cast("list[BaseOrder]", plan["base_orders"])
     orders = sorted(raw_orders, key=lambda item: order_index.get(item.code, len(order_index)))
     for entry in orders:
         limit_text = "—" if entry.limit is None else f"{entry.limit:.3f}"
@@ -1205,9 +1303,9 @@ def render_plan(
         )
         unit_text = "—" if entry.shares_per_unit == 0 else f"{entry.shares_per_unit} 份"
         lines.append(
-            f"| {entry.code} | {entry.weight:.0%} | {entry.target:,.0f} | {entry.have:,.0f} | "
-            f"{entry.gap:+,.0f} | {limit_text} | {now_text} | {unit_text} | "
-            f"{entry.shares_to_target} 份 |"
+            f"| {entry.code} | {entry.weight:.0%} | {entry.band:.0%} | {entry.target:,.0f} | "
+            f"{entry.have:,.0f} | {entry.gap:+,.0f} | {limit_text} | {now_text} | "
+            f"{unit_text} | {entry.shares_to_target} 份 |"
         )
     gap_total = sum(entry.gap for entry in orders)
     unit_amount = sum(entry.amount_per_unit for entry in orders)
@@ -1272,6 +1370,18 @@ def base_targets_from_universe(path: Path) -> dict[str, float]:
     out = {}
     for item in data.get("instruments", []):
         if item.get("kind") == "base_etf" and item.get("target"):
+            out[str(item["symbol"])] = float(item["target"])
+    return out
+
+
+def steady_targets_from_universe(path: Path) -> dict[str, float]:
+    """稳健 ETF 的目标权重（占总资产）：有长期目标、按仓位带在目标附近加减。"""
+    import yaml
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    out = {}
+    for item in data.get("instruments", []):
+        if item.get("kind") == "steady_etf" and item.get("target"):
             out[str(item["symbol"])] = float(item["target"])
     return out
 

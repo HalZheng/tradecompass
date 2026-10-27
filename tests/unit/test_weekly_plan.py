@@ -16,6 +16,7 @@ from tradecompass.research.weekly_plan import (
     WatchView,
     _cleanup,
     _etf_position_band,
+    _etf_target_order,
     _etf_trend_strength,
     _strength,
     _top_up_shares,
@@ -25,6 +26,7 @@ from tradecompass.research.weekly_plan import (
     plan_payload,
     render_plan,
     replay_paths,
+    steady_targets_from_universe,
 )
 
 
@@ -163,6 +165,8 @@ def _empty_plan(as_of: date) -> dict[str, object]:
         "slots": {"防御": 3},
         "slot_value": 10_116.0,
         "stock_capital": 121_387.0,
+        "stock_share": 0.4,
+        "steady_targets": {},
         "cash": 18_288.0,
         "total_assets": 242_774.0,
         "sold_recently": [],
@@ -370,6 +374,74 @@ def test_report_shows_etf_position_band_but_not_auto_orders() -> None:
     assert "ETF 仓位带" in text and "只建议，不自动下单" in text
     assert "核心+仓位带" in text and "高位（85）：减到 50% 仓" in text
     assert "低位止跌" in text
+
+
+def test_etf_target_order_rounds_to_lots_and_caps_sell() -> None:
+    """稳健 ETF 的目标缺口翻成整手建议：减仓不超过持有，差不到一手不动。"""
+    target, gap, order = _etf_target_order(9_000, 5_000, 1.0, 5_000)
+    assert target == 9_000 and gap == 4_000
+    assert order == "加 4,000 份（约 4,000 元）"
+    _, gap, order = _etf_target_order(5_000, 12_000, 1.0, 12_000)
+    assert gap == -7_000 and order.startswith("减 7,000 份")
+    _, _, order = _etf_target_order(1_000, 12_000, 1.0, 500)
+    assert order.startswith("减 500 份")
+    assert _etf_target_order(10_050, 10_000, 1.0, 10_000)[2] == "差不足一手，攒够再加"
+    assert _etf_target_order(10_000, 10_050, 1.0, 10_050)[2] == "超配不足一手，暂不动"
+
+
+def test_steady_targets_from_universe(tmp_path) -> None:
+    """稳健目标只读 steady_etf，与底仓的 base_etf 比例分开。"""
+    path = tmp_path / "universe.yaml"
+    path.write_text(
+        "instruments:\n"
+        '  - {symbol: "510300", kind: base_etf, target: 0.5}\n'
+        '  - {symbol: "159201", kind: steady_etf, target: 0.04}\n'
+        '  - {symbol: "513910", kind: steady_etf, target: 0.03}\n',
+        encoding="utf-8",
+    )
+    assert steady_targets_from_universe(path) == {"159201": 0.04, "513910": 0.03}
+
+
+def test_report_shows_steady_target_and_trim_order() -> None:
+    """稳健 ETF 要给出目标金额、差额和整手建议，不能只有仓位带系数。"""
+    as_of = date(2026, 3, 5)
+    plan = _empty_plan(as_of)
+    plan["steady_targets"] = {"159501": 0.03}
+    plan["views"] = [
+        HoldingView(
+            "159501", "纳指基金", "ETF", 10_000, 1.0, 0.9, 10_000.0, 0.11, "ETF·稳健",
+            None, None, 1.0, 1.0, None, "稳健：持有", "x",
+            asset_class="overseas", strategy="core_band",
+            etf_position=85.0, etf_band=0.5, etf_band_action="高位（85）：减到 50% 仓",
+            etf_target_value=3_642.0, etf_gap=-6_358.0,
+            etf_order="减 6,300 份（约 6,300 元）",
+        )
+    ]
+    text = render_plan(
+        plan,
+        base_targets={"510300": 0.5},
+        behavior_lines=["x"],
+        market_line="m",
+        notes=["n"],
+        next_day=date(2026, 3, 6),
+        statement_period=(date(2024, 1, 2), as_of),
+    )
+    assert "目标结构" in text and "稳健 ETF 3%" in text
+    assert "| 3,642 | 10,000 | -6,358 | 减 6,300 份（约 6,300 元） |" in text
+
+
+def test_base_orders_apply_band_multiplier() -> None:
+    """底仓目标 = 50% 上限 × 底仓内比例 × 仓位带；高位减仓时目标随之下降。"""
+    orders = base_orders(
+        {"510300": 0.5},
+        total_assets=100_000,
+        views=[],
+        etf_bars={"sh.510300": _base_bars(4.0)},
+        cash_now=0,
+        band_multipliers={"510300": 0.6},
+    )
+    assert orders[0].band == 0.6
+    assert orders[0].target == 15_000 and orders[0].gap == 15_000
 
 
 def test_top_up_shares_rounds_to_lots_and_never_exceeds_target() -> None:

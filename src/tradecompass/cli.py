@@ -1913,6 +1913,7 @@ def weekly_plan(
         plan_payload,
         render_plan,
         replay_paths,
+        steady_targets_from_universe,
         watchlist_from_universe,
     )
 
@@ -1985,8 +1986,10 @@ def weekly_plan(
     cut = pd.Timestamp(as_of)
     names = _stock_names(cfg.paths.data / "research" / "names.parquet")
     etf_codes = [e.code for e in ETFS]
-    base = base_targets_from_universe(cfg.paths.config / "universe.yaml")
-    watchlist = watchlist_from_universe(cfg.paths.config / "universe.yaml")
+    universe_path = cfg.paths.config / "universe.yaml"
+    base = base_targets_from_universe(universe_path)
+    steady = steady_targets_from_universe(universe_path)
+    watchlist = watchlist_from_universe(universe_path)
     state_path = cfg.paths.home / "portfolio" / "plan_state.json"
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
     # ETF 行情、指数与成交流水也要截断到 as_of，否则 --as-of 的均线/状态机仍会用到之后的数据
@@ -2001,6 +2004,7 @@ def weekly_plan(
         etf_bars=etf_bars,
         etf_names={e.code: e.name for e in ETFS},
         etf_roles=etf_roles(),
+        steady_targets=steady,
         names=names, max_new_buys=max_new_buys,
         cleanup_since=state.get("cleanup_since", {}),
         watchlist=watchlist,
