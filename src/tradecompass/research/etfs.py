@@ -66,7 +66,6 @@ ASSET_CLASS_LABELS = {
 
 STRATEGY_LABELS = {
     "core_band": "核心+仓位带",
-    "core_band_high_floor": "核心+高floor仓位带",
     "hold": "持有/再平衡",
     "swing_cleanup": "MA20清理/不新增",
 }
@@ -85,8 +84,6 @@ class BandParams:
 
 ETF_BAND: dict[str, BandParams] = {
     "core_band": BandParams(85.0, 70.0, 30.0, 0.5, 0.75, 1.0, 0.6),
-    # 黄金/商品：长期趋势更强，核心更高，只在极端高位减、低位未止跌也留 85%。
-    "core_band_high_floor": BandParams(90.0, 75.0, 35.0, 0.7, 0.85, 1.0, 0.85),
 }
 
 
@@ -168,12 +165,10 @@ def asset_class_of(info: EtfInfo) -> str:
 
 
 def strategy_of(info: EtfInfo) -> str:
-    """由资产类别推导策略族；底仓的债券只做再平衡，黄金用高 floor 仓位带。"""
+    """由资产类别推导策略族；债券/黄金只做再平衡，仓位带只用于宽基/红利/海外。"""
     asset = asset_class_of(info)
-    if asset == "bond":
+    if asset in ("bond", "commodity"):
         return "hold"
-    if asset == "commodity":
-        return "core_band_high_floor"
     if asset in ("equity_broad", "equity_value", "overseas"):
         return "core_band"
     return "swing_cleanup"
@@ -182,7 +177,7 @@ def strategy_of(info: EtfInfo) -> str:
 def role_of(info: EtfInfo) -> str:
     if info.category == "底仓":
         return "底仓"
-    if strategy_of(info) in ("core_band", "core_band_high_floor", "hold"):
+    if strategy_of(info) in ("core_band", "hold"):
         return "稳健"
     return "波段"
 

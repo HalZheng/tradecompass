@@ -47,7 +47,7 @@ def test_etf_asset_class_drives_strategy_family() -> None:
     assert infos["sh.510300"].asset_class == "equity_broad"
     assert strategy_of(infos["sh.510300"]) == "core_band"
     assert infos["sh.518880"].asset_class == "commodity"
-    assert strategy_of(infos["sh.518880"]) == "core_band_high_floor"
+    assert strategy_of(infos["sh.518880"]) == "hold"
     assert infos["sh.511090"].asset_class == "bond"
     assert strategy_of(infos["sh.511090"]) == "hold"
     assert infos["sh.512480"].asset_class == "sector"
@@ -58,8 +58,8 @@ def test_etf_asset_class_drives_strategy_family() -> None:
     assert strategy_of(infos["sz.159636"]) == "swing_cleanup"
 
 
-def test_etf_position_band_high_low_and_gold_floor() -> None:
-    """高位减半、低位未止跌保留 60%；黄金用更高 floor（0.7）。"""
+def test_etf_position_band_high_low_and_hold_no_band() -> None:
+    """高位减半、低位未止跌保留 60%；黄金/债券是 hold，不做仓位带。"""
     up = _etf_position_band(_etf_trend_bars(0.002, n=300), "core_band")
     assert up is not None
     pos, _stabilized, band, action = up
@@ -70,8 +70,7 @@ def test_etf_position_band_high_low_and_gold_floor() -> None:
     pos, _stabilized, band, action = down
     assert pos <= 30 and band == 0.6 and "等止跌" in action
 
-    gold = _etf_position_band(_etf_trend_bars(0.002, n=300), "core_band_high_floor")
-    assert gold is not None and gold[2] == 0.7
+    assert _etf_position_band(_etf_trend_bars(0.002, n=300), "hold") is None
 
 
 def trades() -> pd.DataFrame:
