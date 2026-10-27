@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import date
 
+import numpy as np
 import pandas as pd
 
 from tradecompass.account.behavior import analyze
@@ -14,6 +15,8 @@ from tradecompass.research.weekly_plan import (
     HoldingView,
     WatchView,
     _cleanup,
+    _etf_trend_strength,
+    _strength,
     _top_up_shares,
     apply_patience,
     base_orders,
@@ -86,11 +89,12 @@ def test_cleanup_without_moving_averages_never_claims_above() -> None:
 
 
 def _view(
-    code: str, action: str, quantity: int = 1000, score: float | None = None
+    code: str, action: str, quantity: int = 1000, score: float | None = None,
+    strength: float | None = None,
 ) -> HoldingView:
     return HoldingView(code, code, "股票", quantity, 10.0, 12.0, 10_000.0, -0.17, "防御",
                        None, None, 10.5, 11.0, None, action, "x；10.500 卖一半，11.000 卖剩余",
-                       score)
+                       score, strength=strength)
 
 
 def test_cleanup_patience_is_remembered_and_escalates() -> None:
@@ -239,11 +243,12 @@ def test_report_shows_group_score_and_says_it_is_not_comparable_across_groups() 
     as_of = date(2026, 3, 5)
     plan = _empty_plan(as_of)
     plan["views"] = [
-        _view("600000", "清理：反弹分批", score=0.43),
+        _view("600000", "清理：反弹分批", score=0.43, strength=93.0),
         _view("510300", "底仓：保留"),
     ]
     plan["ideas"] = [
-        BuyIdea("000157", "中联重科", "周期制造", 1, 5.89, 6.01, 1600, 9616.0, score=1.57)
+        BuyIdea("000157", "中联重科", "周期制造", 1, 5.89, 6.01, 1600, 9616.0,
+                score=1.57, strength=67.0)
     ]
     text = render_plan(
         plan,
@@ -254,9 +259,59 @@ def test_report_shows_group_score_and_says_it_is_not_comparable_across_groups() 
         next_day=date(2026, 3, 6),
         statement_period=(date(2024, 1, 2), as_of),
     )
-    assert "组内分" in text
+    assert "组内分" in text and "强度" in text
     assert "+0.43" in text and "+1.57" in text
+    assert "| +0.43 | 93 |" in text and "| +1.57 | 67 |" in text
     assert "跨组不可比" in text
+
+
+def test_strength_maps_score_relative_to_line() -> None:
+    """0–100 强度：刚好在门槛上 50，高/低一个标准差约 84/16；缺数据返回 None。"""
+    assert _strength(0.0, 0.0) == 50.0
+    assert round(_strength(1.0, 0.0)) == 84
+    assert round(_strength(-1.0, 0.0)) == 16
+    assert _strength(None, 0.0) is None
+    assert _strength(0.0, None) is None
+
+
+def _etf_trend_bars(step: float, n: int = 200) -> pd.DataFrame:
+    close = np.cumprod(np.full(n, 1.0 + step))
+    preclose = np.concatenate([[close[0]], close[:-1]])
+    return pd.DataFrame(
+        {"close": close, "preclose": preclose},
+        index=pd.bdate_range("2025-01-01", periods=n),
+    )
+
+
+def test_etf_trend_strength_rewards_uptrend_and_penalises_downtrend() -> None:
+    """波段 ETF 用趋势健康度：上涨高分、下跌低分；不足 120 日不给分。"""
+    assert _etf_trend_strength(_etf_trend_bars(0.002)) > 80
+    assert _etf_trend_strength(_etf_trend_bars(-0.002)) < 20
+    assert _etf_trend_strength(_etf_trend_bars(0.002, n=50)) is None
+
+
+def test_report_shows_etf_trend_strength_and_says_it_is_reference_only() -> None:
+    """波段 ETF 不再是 “-”，但报告必须写明它只是趋势参考、不改暂行买卖规则。"""
+    plan = _empty_plan(date(2026, 3, 5))
+    plan["views"] = [
+        HoldingView(
+            "159755", "电池ETF", "ETF", 100, 1.0, 1.0, 100.0, 0.0, "ETF·波段",
+            None, None, 1.0, 1.0, None, "清理：反弹分批",
+            "趋势强度 15/100；x", strength=15.0,
+        )
+    ]
+    text = render_plan(
+        plan,
+        base_targets={"510300": 0.5},
+        behavior_lines=["x"],
+        market_line="m",
+        notes=["n"],
+        next_day=date(2026, 3, 6),
+        statement_period=(date(2024, 1, 2), date(2026, 3, 5)),
+    )
+    assert "| ETF·波段 | - | 15 |" in text
+    assert "波段 ETF=趋势健康度" in text
+    assert "只作清理参考" in text
 
 
 def test_top_up_shares_rounds_to_lots_and_never_exceeds_target() -> None:
@@ -343,9 +398,10 @@ def test_cleanup_summary_shows_resulting_portfolio() -> None:
 
 def test_plan_payload_carries_score() -> None:
     plan = _empty_plan(date(2026, 3, 5))
-    plan["views"] = [_view("600000", "清理：反弹分批", score=0.4321)]
+    plan["views"] = [_view("600000", "清理：反弹分批", score=0.4321, strength=41.0)]
     plan["ideas"] = [
-        BuyIdea("000157", "中联重科", "周期制造", 1, 5.89, 6.01, 1600, 9616.0, score=1.5678)
+        BuyIdea("000157", "中联重科", "周期制造", 1, 5.89, 6.01, 1600, 9616.0,
+                score=1.5678, strength=78.0)
     ]
     payload = plan_payload(
         plan,
@@ -354,7 +410,9 @@ def test_plan_payload_carries_score() -> None:
         max_new_buys=3,
     )
     assert payload["holdings"][0]["score"] == 0.4321  # type: ignore[index]
+    assert payload["holdings"][0]["strength"] == 41.0  # type: ignore[index]
     assert payload["buys"][0]["score"] == 1.5678  # type: ignore[index]
+    assert payload["buys"][0]["strength"] == 78.0  # type: ignore[index]
 
 
 def test_replay_paths_are_isolated_from_live_and_track(tmp_path) -> None:

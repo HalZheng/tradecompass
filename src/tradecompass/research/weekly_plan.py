@@ -61,6 +61,8 @@ class HoldingView:
     """仍在该组保留线内、但市值低于目标仓位时，建议补足的股数（0 表示不补）。"""
     drivers: str = ""
     """分数的主要来源：贡献最大的两个因子与拖累最大的一个。"""
+    strength: float | None = None
+    """0–100 的相对强度：组内分相对当日门槛的位置，50 = 刚好在线上。不是上涨概率。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +82,8 @@ class BuyIdea:
     """候选来源：``池内`` 指数成分 / ``自选`` 个人自选池。"""
     drivers: str = ""
     """分数的主要来源：贡献最大的两个因子与拖累最大的一个。"""
+    strength: float | None = None
+    """0–100 的相对强度：相对“买入线”（第一个没买到的同组标的）的位置。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +98,8 @@ class WatchView:
     score: float | None
     drivers: str
     status: str
+    strength: float | None = None
+    """0–100 的相对强度：组内分相对保留门槛的位置。"""
 
 
 def _bs_code(code: str) -> str:
@@ -114,6 +120,35 @@ def _etf_mas(bars: pd.DataFrame) -> tuple[float | None, float | None, float | No
     adj = (1.0 + ret).cumprod().to_numpy()
     scale = float(bars["close"].iloc[-1] / adj[-1])
     return _ma_raw(adj, scale, 10), _ma_raw(adj, scale, 20), _ma_raw(adj, scale, 60)
+
+
+def _etf_trend_strength(bars: pd.DataFrame) -> float | None:
+    """波段 ETF 的趋势健康度（0–100），只作展示与清理参考。
+
+    ETF 不该套股票的横截面 z 分数：样本太少、因子集也对不上；而动量轮动已经实测无效。
+    这里用时间序列趋势：以“现价相对 MA20 的偏离”为主（50 = 刚好在 MA20），
+    再用 MA60/MA120 位置和 MA20 斜率加减分，高=趋势强、低=趋势弱。
+    它不改变 ``etf_action`` 的暂行 MA20 规则，也不用于新买；要用于交易必须先回测。
+    """
+    if len(bars) < 120:
+        return None
+    ret = (bars["close"] / bars["preclose"] - 1.0).fillna(0.0)
+    adj = (1.0 + ret).cumprod().to_numpy()
+    scale = float(bars["close"].iloc[-1] / adj[-1])
+    ma20 = _ma_raw(adj, scale, 20)
+    ma60 = _ma_raw(adj, scale, 60)
+    ma120 = _ma_raw(adj, scale, 120)
+    if ma20 is None or ma60 is None:
+        return None
+
+    price = float(bars["close"].iloc[-1])
+    # 以 MA20 为中性线：偏离 ±4% 大约对应 88/12 分，再叠加中长期位置与斜率
+    score = 50.0 + 50.0 * math.tanh((price / ma20 - 1.0) / 0.04)
+    score += 8.0 if price >= ma60 else -8.0
+    if ma120 is not None:
+        score += 8.0 if price >= ma120 else -8.0
+    score += 8.0 if adj[-20:].mean() > adj[-40:-20].mean() else -8.0
+    return max(0.0, min(100.0, score))
 
 
 def _drivers(row: pd.Series, weights: pd.Series) -> str:
@@ -141,6 +176,18 @@ def _top_up_shares(value: float, target: float, price: float) -> int:
     if deficit <= 0 or price <= 0:
         return 0
     return int(deficit // (price * LOT)) * LOT
+
+
+def _strength(score: float | None, line: float | None) -> float | None:
+    """把组内分相对门槛的位置映射成 0–100，方便人读。
+
+    ``line`` 是该组当日的保留线（持仓）或买入线（新买）分数；分数刚好在线上给 50，
+    高一个标准差约 84，低一个标准差约 16。它是相对强度，不是上涨概率，也不做买卖阈值。
+    """
+    if score is None or line is None:
+        return None
+    edge = score - line
+    return 100.0 * 0.5 * (1.0 + math.erf(edge / math.sqrt(2.0)))
 
 
 def _cleanup(price: float, ma10: float | None, ma20: float | None) -> tuple[str, str]:
@@ -461,12 +508,20 @@ def build_plan(
         value = float(row["value"])
         pnl = price / cost - 1.0 if cost else 0.0
         if bs in etf_names:
-            ma10, ma20, ma60 = _etf_mas(etf_bars.get(bs, pd.DataFrame()))
+            bars = etf_bars.get(bs, pd.DataFrame())
+            ma10, ma20, ma60 = _etf_mas(bars)
             role = (etf_roles or {}).get(bs, "波段")
             action, detail = etf_action(role, code, price, ma10, ma20, base_targets)
+            strength = _etf_trend_strength(bars) if role == "波段" else None
+            if strength is not None and ma20 is not None:
+                detail = (
+                    f"趋势强度 {strength:.0f}/100（{price / ma20 - 1.0:+.1%} vs MA20）；"
+                    + detail
+                )
             group = "底仓" if code in base_targets else f"ETF·{role}"
             views.append(HoldingView(code, name_, "ETF", qty, price, cost, value,
-                                     pnl, group, None, None, ma10, ma20, ma60, action, detail))
+                                     pnl, group, None, None, ma10, ma20, ma60, action, detail,
+                                     strength=strength))
             continue
         j = engine.col.get(bs)
         ma10 = ma20 = ma60 = None
@@ -532,7 +587,7 @@ def build_plan(
                 detail = "今日无法评分（停牌/ST/因子不足）；" + detail
         views.append(HoldingView(code, name_, "股票", qty, price, cost, value,
                                  pnl, group, rank, zone, ma10, ma20, ma60, action, detail,
-                                 score, add_shares, drivers_of(bs)))
+                                 score, add_shares, drivers_of(bs), _strength(score, cut)))
 
     watch_set = {_bs_code(code) for code in watchlist}
     views, cleanup_state = apply_patience(
@@ -545,8 +600,10 @@ def build_plan(
         and etf_bars[_bs_code(v.code)].index.max() < as_of
     )
     ideas: list[BuyIdea] = []
+    buy_cut: dict[str, float] = {}
     for name, ranked in ranked_by_rule.items():
         room = max(0, slots[name] - kept_by_rule.get(name, 0))
+        last_pos = 0
         for pos, code in enumerate(ranked.index, start=1):
             if room <= 0:
                 break
@@ -568,7 +625,12 @@ def build_plan(
                         origin="自选" if code in watch_set else "池内",
                         drivers=drivers_of(code))
             )
+            last_pos = pos
             room -= 1
+        if last_pos:
+            # 买入线 = 同组第一个没买到的标的；没有下一只时退回最后一只
+            line = last_pos if last_pos < len(ranked) else last_pos - 1
+            buy_cut[name] = float(ranked.iloc[line])
     ideas.sort(key=lambda b: (b.rank, b.group))
     # 现金能覆盖的前 max_new_buys 只标“买入”，其余是“候补”；标记在这里做，
     # 报告与结构化落盘共用同一份结果，避免两处各算一遍。
@@ -580,7 +642,11 @@ def build_plan(
         if tag == "买入":
             budget -= idea.amount
             shown += 1
-        tagged.append(dataclasses.replace(idea, tag=tag))
+        tagged.append(
+            dataclasses.replace(
+                idea, tag=tag, strength=_strength(idea.score, buy_cut.get(idea.group))
+            )
+        )
     ideas = tagged
 
     idx = group_indices(engine)
@@ -647,7 +713,8 @@ def build_plan(
         else:
             status = "不买"
         watch_views.append(WatchView(code, names.get(code, code), group, pos, keep, score,
-                                     drivers_of(bs), status))
+                                     drivers_of(bs), status,
+                                     _strength(score, cut_scores.get(group))))
 
     return {
         "as_of": as_of.date(),
@@ -729,6 +796,7 @@ def plan_payload(
             "action": v.action,
             "detail": v.detail,
             "score": None if v.score is None else round(v.score, 4),
+            "strength": None if v.strength is None else round(v.strength, 1),
             "add_shares": v.add_shares,
             "drivers": v.drivers,
         }
@@ -742,6 +810,7 @@ def plan_payload(
             "group": b.group,
             "rank": b.rank,
             "score": None if b.score is None else round(b.score, 4),
+            "strength": None if b.strength is None else round(b.strength, 1),
             "close": round(b.close, 3),
             "limit": round(b.limit, 3),
             "shares": b.shares,
@@ -759,6 +828,7 @@ def plan_payload(
             "rank": w.rank,
             "keep_line": w.zone,
             "score": None if w.score is None else round(w.score, 4),
+            "strength": None if w.strength is None else round(w.strength, 1),
             "drivers": w.drivers,
             "status": w.status,
         }
@@ -912,9 +982,9 @@ def render_plan(
         "",
         "## 四、持仓逐只处理",
         "",
-        "| 代码 | 名称 | 数量 | 现价 | 成本 | 浮盈亏 | 板块组/排名 | 组内分 | 驱动 | "
+        "| 代码 | 名称 | 数量 | 现价 | 成本 | 浮盈亏 | 板块组/排名 | 组内分 | 强度 | 驱动 | "
         "MA10 | MA20 | 结论 | 怎么做 |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
 
     def fmt(v: float | None) -> str:
@@ -923,19 +993,27 @@ def render_plan(
     def fmt_score(v: float | None) -> str:
         return f"{v:+.2f}" if v is not None else "-"
 
+    def fmt_strength(v: float | None) -> str:
+        return f"{v:.0f}" if v is not None else "-"
+
     order = {"加仓": 0, "保留": 0, "底仓：保留": 1, "稳健：持有": 2, "波段：持有观察": 3}
     for v in sorted(views, key=lambda x: (order.get(x.action, 4), x.pnl_pct)):
         where = f"{v.group} #{v.rank}" if v.rank else v.group
         lines.append(
             f"| {v.code} | {v.name} | {v.quantity} | {v.price:.3f} | {v.cost:.3f} | "
-            f"{v.pnl_pct:+.1%} | {where} | {fmt_score(v.score)} | {v.drivers or '-'} | "
-            f"{fmt(v.ma10)} | {fmt(v.ma20)} | **{v.action}** | {v.detail} |"
+            f"{v.pnl_pct:+.1%} | {where} | {fmt_score(v.score)} | {fmt_strength(v.strength)} | "
+            f"{v.drivers or '-'} | {fmt(v.ma10)} | {fmt(v.ma20)} | **{v.action}** | {v.detail} |"
         )
     lines += [
         "",
         "组内分：该标的在所属板块组里的因子综合分——各因子先做组内 z 分数，再按"
         "“先验等权 50% + 滚动 ICIR 50%”加权合成。排名就是这个分数的降序，"
         "所以**只能同组横向比较，跨组不可比**；负分表示在该组里偏弱。",
+        "强度（0–100）：股票=组内分相对当日门槛（50 = 刚好在线上，>80 明显强，"
+        "<20 明显弱；持仓/自选相对保留线，新买相对买入线）；"
+        "波段 ETF=趋势健康度（站上 MA20/60/120、均线向上得分，50 为中性）；"
+        "底仓/稳健 ETF 不打分。它不是上涨概率，也不能当绝对买卖阈值；"
+        "波段 ETF 的强度只作清理参考，买卖仍按暂行 MA20 规则，规则回测通过前不用于新买。",
         "",
         f"清理规则：条件单价位每天按最新均线更新；"
         f"进入清理满 {CLEANUP_PATIENCE} 个交易日仍未反弹到位的，"
@@ -954,15 +1032,15 @@ def render_plan(
         "",
         f"## 五、新买入（{target_day}，最多 {max_new_buys} 只，按排名先后，限价不追高）",
         "",
-        f"| 优先级 | 代码 | 名称 | 来源 | 板块组/排名 | 组内分 | 驱动 | "
+        f"| 优先级 | 代码 | 名称 | 来源 | 板块组/排名 | 组内分 | 强度 | 驱动 | "
         f"{as_of:%m-%d} 收盘 | 限价（≤） | 股数 | 约金额 |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for k, b in enumerate(ideas, start=1):
         lines.append(
             f"| {b.tag} {k} | {b.code} | {b.name} | {b.origin} | {b.group} #{b.rank} | "
-            f"{fmt_score(b.score)} | {b.drivers or '-'} | {b.close:.2f} | "
-            f"{b.limit:.2f} | {b.shares} | {b.amount:,.0f} |"
+            f"{fmt_score(b.score)} | {fmt_strength(b.strength)} | {b.drivers or '-'} | "
+            f"{b.close:.2f} | {b.limit:.2f} | {b.shares} | {b.amount:,.0f} |"
         )
     lines += [
         "",
@@ -978,15 +1056,16 @@ def render_plan(
         "",
         f"## 六、自选池体检（{len(watch_rows)} 只未持仓的，按组内排名）",
         "",
-        "| 代码 | 名称 | 板块组 | 排名/保留线 | 组内分 | 驱动 | 状态 |",
-        "|---|---|---|---|---|---|---|",
+        "| 代码 | 名称 | 板块组 | 排名/保留线 | 组内分 | 强度 | 驱动 | 状态 |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for w in sorted(watch_rows, key=lambda x: (x.rank is None, x.rank or 0, x.code)):
         where = f"{w.group} #{w.rank}" if w.rank else w.group
         keep_text = f"/{w.zone}" if w.zone else ""
         lines.append(
             f"| {w.code} | {w.name} | {where}{keep_text} | "
-            f"{fmt_score(w.score)} | {w.drivers or '-'} | {w.status} |"
+            f"{fmt_score(w.score)} | {fmt_strength(w.strength)} | {w.drivers or '-'} | "
+            f"{w.status} |"
         )
     lines += [
         "",

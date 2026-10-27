@@ -301,6 +301,7 @@ def test_holding_keep_line_uses_pool_rank_not_merged_rank() -> None:
     view = plan["views"][0]  # type: ignore[index]
     assert view.action == "保留"
     assert f"第 {line} 名" in view.detail
+    assert round(view.strength) == 50  # 刚好在保留线上
 
 
 def test_plan_holds_recent_buy_even_below_keep_line() -> None:
@@ -315,6 +316,7 @@ def test_plan_holds_recent_buy_even_below_keep_line() -> None:
     held = _plan(eng, [_holding(loser)], trades=trades)["views"][0]  # type: ignore[index]
     assert held.action == "保留"
     assert "最短持有 5 日" in held.detail
+    assert held.strength is not None and held.strength < 50  # 分不够，只是没到最短持有
 
     without_trade = _plan(eng, [_holding(loser)])["views"][0]  # type: ignore[index]
     assert without_trade.action.startswith("清理")
@@ -376,6 +378,8 @@ def test_watchlist_outsider_is_buyable_unless_st() -> None:
         engine(panel, industry), [], watchlist=[outsider[3:]], max_new_buys=3
     )["ideas"]
     assert outsider[3:] in {idea.code for idea in ideas}  # type: ignore[union-attr]
+    top = next(idea for idea in ideas if idea.code == outsider[3:])  # type: ignore[union-attr]
+    assert top.strength is not None and top.strength > 50  # 明显高于买入线
 
     st_panel, st_industry, st_outsider = _plan_universe(outsider_st=True)
     st_ideas = _plan(
