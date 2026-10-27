@@ -1,16 +1,20 @@
-"""ETF 判定池：按品种分宽基/行业/跨境，按操作角色分底仓/稳健/波段。
+"""ETF 判定池：按资产类别（收益驱动）分信号族，按操作角色分底仓/稳健/波段。
 
-- 底仓：只做再平衡（目标比例在 universe.yaml）；
-- 稳健：宽基、红利/自由现金流、海外宽基，长期持有，不做波段；
-- 波段：行业/主题 ETF，属于波段仓。动量轮动版本已实测无效，波段规则仍待研究。
+资产类别在 ``asset_class``（equity_broad/equity_value/sector/overseas/
+overseas_sector/commodity/bond），策略族由 ``strategy_of`` 推导：
 
-行业 ETF 只在对应行业指数数据缺失时作为参考；当前用成分股合成的板块指数，数据完整。
-名单为常见品种（2026-10 人工整理），有幸存者偏差：回测里每只 ETF 上市满 250 日才可选。
+- ``core_band``：A股宽基/红利、海外宽基——核心持有 + 250 日位置仓位带；
+- ``core_band_high_floor``：黄金/商品——核心仓位更高（floor 0.7），只在极端高位减；
+- ``hold``：债券——战略持有/再平衡，不做股票式仓位带；
+- ``swing_cleanup``：行业/主题、海外行业——不新增，按 MA20 清理，趋势强度只做展示。
+
+``t0/qdii/aum/avg_amount/tracking_error`` 是元数据占位：目前只用于分类/展示，
+执行仍按 T+1、真实费率与滑点。名单为常见品种（2026-10 人工整理），有幸存者偏差。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,9 +22,75 @@ class EtfInfo:
     code: str
     name: str
     category: str
+    asset_class: str = ""
+    t0: bool | None = None
+    """是否 T+0；None = 未接入/未确认。当前执行仍按 T+1。"""
+    qdii: bool = False
+    aum: float | None = None
+    """规模（亿元），暂未接入数据。"""
+    avg_amount: float | None = None
+    """日均成交额（亿元），暂未接入数据。"""
+    tracking_error: float | None = None
+    """跟踪误差，暂未接入数据。"""
 
 
-ETFS: tuple[EtfInfo, ...] = (
+# 资产类别：按“收益驱动”分，不按表面名称分。
+ASSET_CLASS: dict[str, str] = {
+    "sh.510300": "equity_broad",
+    "sh.510050": "equity_broad",
+    "sh.510500": "equity_broad",
+    "sh.512100": "equity_broad",
+    "sz.159915": "equity_broad",
+    "sh.588000": "equity_broad",
+    "sh.515080": "equity_value",
+    "sz.159201": "equity_value",
+    "sh.513910": "equity_value",
+    "sh.513100": "overseas",
+    "sz.159501": "overseas",
+    "sh.513400": "overseas",
+    "sz.159636": "overseas_sector",
+    "sh.520600": "overseas_sector",
+    "sh.518880": "commodity",
+    "sh.511090": "bond",
+}
+
+ASSET_CLASS_LABELS = {
+    "equity_broad": "A股宽基",
+    "equity_value": "红利/价值（A股/港股）",
+    "sector": "A股行业/主题",
+    "overseas": "海外/QDII",
+    "overseas_sector": "海外行业",
+    "commodity": "黄金/商品",
+    "bond": "债券",
+}
+
+STRATEGY_LABELS = {
+    "core_band": "核心+仓位带",
+    "core_band_high_floor": "核心+高floor仓位带",
+    "hold": "持有/再平衡",
+    "swing_cleanup": "MA20清理/不新增",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class BandParams:
+    high_cut: float
+    mid_cut: float
+    low_cut: float
+    high: float
+    mid: float
+    neutral: float
+    low_wait: float
+
+
+ETF_BAND: dict[str, BandParams] = {
+    "core_band": BandParams(85.0, 70.0, 30.0, 0.5, 0.75, 1.0, 0.6),
+    # 黄金/商品：长期趋势更强，核心更高，只在极端高位减、低位未止跌也留 85%。
+    "core_band_high_floor": BandParams(90.0, 75.0, 35.0, 0.7, 0.85, 1.0, 0.85),
+}
+
+
+_RAW_ETFS: tuple[EtfInfo, ...] = (
     EtfInfo("sh.510300", "沪深300ETF", "底仓"),
     EtfInfo("sh.518880", "黄金ETF", "底仓"),
     EtfInfo("sh.511090", "30年国债ETF", "底仓"),
@@ -68,18 +138,51 @@ ETFS: tuple[EtfInfo, ...] = (
     EtfInfo("sh.520600", "汽车港股ETF", "跨境"),
 )
 
+
+def _derive_asset_class(info: EtfInfo) -> str:
+    if info.code in ASSET_CLASS:
+        return ASSET_CLASS[info.code]
+    if info.category == "行业":
+        return "sector"
+    if info.category == "跨境":
+        return "overseas_sector"
+    if info.category == "底仓":
+        return "commodity"
+    return "equity_broad"
+
+
+ETFS: tuple[EtfInfo, ...] = tuple(
+    replace(
+        info,
+        asset_class=_derive_asset_class(info),
+        qdii=info.category == "跨境",
+    )
+    for info in _RAW_ETFS
+)
+
 ROTATION_CATEGORIES = ("宽基", "行业")
 
-# 红利/现金流类与海外宽基虽不在“宽基”品类，但操作上属于稳健持有
-STEADY_EXTRA = frozenset(
-    {"sh.515080", "sz.159201", "sh.513910", "sh.513100", "sz.159501", "sh.513400"}
-)
+
+def asset_class_of(info: EtfInfo) -> str:
+    return info.asset_class or _derive_asset_class(info)
+
+
+def strategy_of(info: EtfInfo) -> str:
+    """由资产类别推导策略族；底仓的债券只做再平衡，黄金用高 floor 仓位带。"""
+    asset = asset_class_of(info)
+    if asset == "bond":
+        return "hold"
+    if asset == "commodity":
+        return "core_band_high_floor"
+    if asset in ("equity_broad", "equity_value", "overseas"):
+        return "core_band"
+    return "swing_cleanup"
 
 
 def role_of(info: EtfInfo) -> str:
     if info.category == "底仓":
         return "底仓"
-    if info.category == "宽基" or info.code in STEADY_EXTRA:
+    if strategy_of(info) in ("core_band", "core_band_high_floor", "hold"):
         return "稳健"
     return "波段"
 

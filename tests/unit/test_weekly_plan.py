@@ -9,12 +9,13 @@ import numpy as np
 import pandas as pd
 
 from tradecompass.account.behavior import analyze
-from tradecompass.research.etfs import etf_roles
+from tradecompass.research.etfs import etf_by_code, etf_roles, strategy_of
 from tradecompass.research.weekly_plan import (
     BuyIdea,
     HoldingView,
     WatchView,
     _cleanup,
+    _etf_position_band,
     _etf_trend_strength,
     _strength,
     _top_up_shares,
@@ -38,6 +39,39 @@ def test_etf_roles_and_actions() -> None:
     assert etf_action("波段", "159992", 1.1, 1.0, 1.0, base)[0] == "波段：持有观察"
     action, detail = etf_action("波段", "159992", 0.9, 1.0, 1.0, base)
     assert action.startswith("清理") and "暂行" in detail
+
+
+def test_etf_asset_class_drives_strategy_family() -> None:
+    """ETF 先按资产类别（收益驱动）分，再推导策略族；不再靠手工 STEADY_EXTRA。"""
+    infos = etf_by_code()
+    assert infos["sh.510300"].asset_class == "equity_broad"
+    assert strategy_of(infos["sh.510300"]) == "core_band"
+    assert infos["sh.518880"].asset_class == "commodity"
+    assert strategy_of(infos["sh.518880"]) == "core_band_high_floor"
+    assert infos["sh.511090"].asset_class == "bond"
+    assert strategy_of(infos["sh.511090"]) == "hold"
+    assert infos["sh.512480"].asset_class == "sector"
+    assert strategy_of(infos["sh.512480"]) == "swing_cleanup"
+    assert infos["sh.513100"].asset_class == "overseas"
+    assert strategy_of(infos["sh.513100"]) == "core_band"
+    assert infos["sz.159636"].asset_class == "overseas_sector"
+    assert strategy_of(infos["sz.159636"]) == "swing_cleanup"
+
+
+def test_etf_position_band_high_low_and_gold_floor() -> None:
+    """高位减半、低位未止跌保留 60%；黄金用更高 floor（0.7）。"""
+    up = _etf_position_band(_etf_trend_bars(0.002, n=300), "core_band")
+    assert up is not None
+    pos, _stabilized, band, action = up
+    assert pos >= 85 and band == 0.5 and "减到 50%" in action
+
+    down = _etf_position_band(_etf_trend_bars(-0.002, n=300), "core_band")
+    assert down is not None
+    pos, _stabilized, band, action = down
+    assert pos <= 30 and band == 0.6 and "等止跌" in action
+
+    gold = _etf_position_band(_etf_trend_bars(0.002, n=300), "core_band_high_floor")
+    assert gold is not None and gold[2] == 0.7
 
 
 def trades() -> pd.DataFrame:
@@ -312,6 +346,31 @@ def test_report_shows_etf_trend_strength_and_says_it_is_reference_only() -> None
     assert "| ETF·波段 | - | 15 |" in text
     assert "波段 ETF=趋势健康度" in text
     assert "只作清理参考" in text
+
+
+def test_report_shows_etf_position_band_but_not_auto_orders() -> None:
+    """仓位带只给建议：报告要显示位置/系数/动作，并明确不自动下单。"""
+    plan = _empty_plan(date(2026, 3, 5))
+    plan["views"] = [
+        HoldingView(
+            "510300", "沪深300ETF", "ETF", 100, 4.0, 3.8, 400.0, 0.05, "底仓",
+            None, None, 3.9, 3.8, None, "底仓：保留", "x",
+            asset_class="equity_broad", strategy="core_band",
+            etf_position=85.0, etf_band=0.5, etf_band_action="高位（85）：减到 50% 仓",
+        )
+    ]
+    text = render_plan(
+        plan,
+        base_targets={"510300": 0.5},
+        behavior_lines=["x"],
+        market_line="m",
+        notes=["n"],
+        next_day=date(2026, 3, 6),
+        statement_period=(date(2024, 1, 2), date(2026, 3, 5)),
+    )
+    assert "ETF 仓位带" in text and "只建议，不自动下单" in text
+    assert "核心+仓位带" in text and "高位（85）：减到 50% 仓" in text
+    assert "低位止跌" in text
 
 
 def test_top_up_shares_rounds_to_lots_and_never_exceeds_target() -> None:

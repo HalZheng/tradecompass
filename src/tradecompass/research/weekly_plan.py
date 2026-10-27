@@ -24,6 +24,13 @@ import pandas as pd
 
 from tradecompass.research import data as rdata
 from tradecompass.research.data import read_etf_bars
+from tradecompass.research.etfs import (
+    ASSET_CLASS_LABELS,
+    ETF_BAND,
+    STRATEGY_LABELS,
+    etf_by_code,
+    strategy_of,
+)
 from tradecompass.research.factors import factor_by_name
 from tradecompass.research.rolling import LOT, RollingEngine, group_indices
 
@@ -63,6 +70,16 @@ class HoldingView:
     """分数的主要来源：贡献最大的两个因子与拖累最大的一个。"""
     strength: float | None = None
     """0–100 的相对强度：组内分相对当日门槛的位置，50 = 刚好在线上。不是上涨概率。"""
+    asset_class: str = ""
+    """ETF 资产类别（equity_broad/equity_value/sector/overseas/...）；股票为空。"""
+    strategy: str = ""
+    """ETF 策略族（core_band/core_band_high_floor/hold/swing_cleanup）；股票为空。"""
+    etf_position: float | None = None
+    """ETF 现价在过去 250 日高低区间的位置（0–100）；只对仓位带类 ETF 计算。"""
+    etf_band: float | None = None
+    """建议仓位系数（相对目标仓位），如 0.5/0.75/1.0/0.6；不是总资产比例。"""
+    etf_band_action: str = ""
+    """仓位带动作：高位减半、低位止跌加回、等止跌等。只建议，不自动下单。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +166,59 @@ def _etf_trend_strength(bars: pd.DataFrame) -> float | None:
         score += 8.0 if price >= ma120 else -8.0
     score += 8.0 if adj[-20:].mean() > adj[-40:-20].mean() else -8.0
     return max(0.0, min(100.0, score))
+
+
+def _etf_position_band(
+    bars: pd.DataFrame, strategy: str
+) -> tuple[float, bool, float, str] | None:
+    """ETF 仓位带：按 250 日价格位置给“相对目标仓位”的系数。
+
+    只用于 ``core_band``（宽基/红利/海外）和 ``core_band_high_floor``（黄金）：
+    - 高位减、低位止跌后加回，始终保留核心；空出的钱是现金，不加杠杆；
+    - 低位“止跌”是确认（收盘≥MA20 或 5 日收益>0），不是预测反弹概率；
+    - 只建议、不自动下单；债券/行业 ETF 不适用。
+    """
+    params = ETF_BAND.get(strategy)
+    if params is None or len(bars) < 250:
+        return None
+    close = bars["close"].astype(float)
+    pre = bars["preclose"].astype(float)
+    ret = (close / pre - 1.0).fillna(0.0)
+    adj = (1.0 + ret).cumprod().to_numpy()
+    scale = float(close.iloc[-1] / adj[-1])
+    ma20 = _ma_raw(adj, scale, 20)
+    if ma20 is None or not np.isfinite(adj[-1]):
+        return None
+    window = adj[-250:]
+    high = float(np.nanmax(window))
+    low = float(np.nanmin(window))
+    if not np.isfinite(high) or not np.isfinite(low) or high <= low:
+        return None
+    pos = (float(adj[-1]) - low) / (high - low) * 100.0
+    price = float(close.iloc[-1])
+    ret5 = price / float(close.iloc[-6]) - 1.0 if len(close) >= 6 else 0.0
+    stabilized = price >= ma20 or ret5 > 0
+
+    if pos >= params.high_cut:
+        band, zone = params.high, "高位"
+    elif pos >= params.mid_cut:
+        band, zone = params.mid, "偏高"
+    elif pos > params.low_cut:
+        band, zone = params.neutral, "中性"
+    elif stabilized:
+        band, zone = params.neutral, "低位止跌"
+    else:
+        band, zone = params.low_wait, "低位未止跌"
+
+    if zone in ("高位", "偏高"):
+        action = f"{zone}（{pos:.0f}）：减到 {band:.0%} 仓"
+    elif zone == "中性":
+        action = f"中性（{pos:.0f}）：保持 {band:.0%} 仓"
+    elif zone == "低位止跌":
+        action = f"低位止跌（{pos:.0f}）：加回 {band:.0%} 仓"
+    else:
+        action = f"低位未止跌（{pos:.0f}）：保持 {band:.0%} 仓，等止跌"
+    return pos, stabilized, band, action
 
 
 def _drivers(row: pd.Series, weights: pd.Series) -> str:
@@ -427,6 +497,7 @@ def build_plan(
 ) -> dict[str, object]:
     i = len(engine.dates) - 1
     as_of = engine.dates[i]
+    etf_infos = etf_by_code()
     stock_capital = total_assets * stock_share
     slot_value = stock_capital / engine.slots
     slots = engine.rule_slots(i)
@@ -510,6 +581,9 @@ def build_plan(
         if bs in etf_names:
             bars = etf_bars.get(bs, pd.DataFrame())
             ma10, ma20, ma60 = _etf_mas(bars)
+            etf_info = etf_infos.get(bs)
+            asset_class = etf_info.asset_class if etf_info is not None else ""
+            strategy = strategy_of(etf_info) if etf_info is not None else ""
             role = (etf_roles or {}).get(bs, "波段")
             action, detail = etf_action(role, code, price, ma10, ma20, base_targets)
             strength = _etf_trend_strength(bars) if role == "波段" else None
@@ -518,10 +592,17 @@ def build_plan(
                     f"趋势强度 {strength:.0f}/100（{price / ma20 - 1.0:+.1%} vs MA20）；"
                     + detail
                 )
+            etf_position = etf_band = None
+            band_action = ""
+            band_data = _etf_position_band(bars, strategy)
+            if band_data is not None:
+                etf_position, _stabilized, etf_band, band_action = band_data
             group = "底仓" if code in base_targets else f"ETF·{role}"
             views.append(HoldingView(code, name_, "ETF", qty, price, cost, value,
                                      pnl, group, None, None, ma10, ma20, ma60, action, detail,
-                                     strength=strength))
+                                     strength=strength, asset_class=asset_class,
+                                     strategy=strategy, etf_position=etf_position,
+                                     etf_band=etf_band, etf_band_action=band_action))
             continue
         j = engine.col.get(bs)
         ma10 = ma20 = ma60 = None
@@ -797,6 +878,11 @@ def plan_payload(
             "detail": v.detail,
             "score": None if v.score is None else round(v.score, 4),
             "strength": None if v.strength is None else round(v.strength, 1),
+            "asset_class": v.asset_class,
+            "strategy": v.strategy,
+            "etf_position": None if v.etf_position is None else round(v.etf_position, 1),
+            "etf_band": None if v.etf_band is None else round(v.etf_band, 2),
+            "etf_band_action": v.etf_band_action,
             "add_shares": v.add_shares,
             "drivers": v.drivers,
         }
@@ -1004,6 +1090,33 @@ def render_plan(
             f"{v.pnl_pct:+.1%} | {where} | {fmt_score(v.score)} | {fmt_strength(v.strength)} | "
             f"{v.drivers or '-'} | {fmt(v.ma10)} | {fmt(v.ma20)} | **{v.action}** | {v.detail} |"
         )
+    band_rows = [v for v in views if v.etf_band is not None]
+    if band_rows:
+        lines += [
+            "",
+            "## 四之二、ETF 仓位带（只建议，不自动下单）",
+            "",
+            "| 代码 | 名称 | 资产类别 | 角色 | 现价 | 250日位置 | 策略 | 建议系数 | 动作 |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+        for v in sorted(band_rows, key=lambda x: (x.group, x.code)):
+            position = "-" if v.etf_position is None else f"{v.etf_position:.0f}"
+            band = "-" if v.etf_band is None else f"{v.etf_band:.0%}"
+            lines.append(
+                f"| {v.code} | {v.name} | "
+                f"{ASSET_CLASS_LABELS.get(v.asset_class, v.asset_class or '-')} | "
+                f"{v.group.replace('ETF·', '')} | {v.price:.3f} | {position} | "
+                f"{STRATEGY_LABELS.get(v.strategy, v.strategy or '-')} | {band} | "
+                f"{v.etf_band_action or '-'} |"
+            )
+        lines += [
+            "",
+            "仓位带只用于底仓/稳健/黄金：高位减、低位止跌后加回，始终保留核心；"
+            "空出的钱是现金，不加杠杆。系数是“目标仓位的比例”，不是总资产比例；"
+            "底仓 50% 先按上限处理。",
+            "低位止跌 = 收盘≥MA20 或 5 日收益>0，是确认不是预测；"
+            "债券只做再平衡、行业/主题仍按清理规则，都不用这张表。",
+        ]
     lines += [
         "",
         "组内分：该标的在所属板块组里的因子综合分——各因子先做组内 z 分数，再按"
@@ -1012,7 +1125,7 @@ def render_plan(
         "强度（0–100）：股票=组内分相对当日门槛（50 = 刚好在线上，>80 明显强，"
         "<20 明显弱；持仓/自选相对保留线，新买相对买入线）；"
         "波段 ETF=趋势健康度（站上 MA20/60/120、均线向上得分，50 为中性）；"
-        "底仓/稳健 ETF 不打分。它不是上涨概率，也不能当绝对买卖阈值；"
+        "底仓/稳健 ETF 不打分，改看四之二的仓位带。它不是上涨概率，也不能当绝对买卖阈值；"
         "波段 ETF 的强度只作清理参考，买卖仍按暂行 MA20 规则，规则回测通过前不用于新买。",
         "",
         f"清理规则：条件单价位每天按最新均线更新；"
