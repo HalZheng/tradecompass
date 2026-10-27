@@ -41,14 +41,50 @@ def period_returns(panel: Panel, rebalance: list[pd.Timestamp]) -> pd.DataFrame:
     return pd.DataFrame(rows).T
 
 
-def robust_z(values: pd.Series) -> pd.Series:
+@dataclass(frozen=True, slots=True)
+class ZParams:
+    """``robust_z`` 的拟合参数：先按中位数 ±3×MAD 截尾，再标准化。"""
+
+    low: float
+    high: float
+    mean: float
+    std: float
+
+
+def fit_robust_z(values: pd.Series) -> ZParams | None:
+    """在给定的截面样本上拟合标准化参数；样本退化（MAD 或 std 为 0）时返回 None。"""
     median = values.median()
     mad = (values - median).abs().median() * 1.4826
     if not np.isfinite(mad) or mad == 0:
-        return values * 0.0
+        return None
     clipped = values.clip(median - 3 * mad, median + 3 * mad)
     std = clipped.std()
-    return (clipped - clipped.mean()) / std if std > 0 else clipped * 0.0
+    if not std > 0:
+        return None
+    return ZParams(
+        low=float(median - 3 * mad),
+        high=float(median + 3 * mad),
+        mean=float(clipped.mean()),
+        std=float(std),
+    )
+
+
+def apply_robust_z(value: float, params: ZParams) -> float:
+    """把一个新标的的因子值映射到已经拟合好的分布上。
+
+    用于「股票池外的自选/持仓」：标准化参数仍由成分股截面决定，
+    这样既不改写已验证模型的截面分布，又能把池外标的放到同一把尺子上。
+    """
+    if not np.isfinite(value):
+        return float("nan")
+    return (min(max(value, params.low), params.high) - params.mean) / params.std
+
+
+def robust_z(values: pd.Series) -> pd.Series:
+    params = fit_robust_z(values)
+    if params is None:
+        return values * 0.0
+    return (values.clip(params.low, params.high) - params.mean) / params.std
 
 
 def neutralize(values: pd.Series, exposure: pd.Series) -> pd.Series:

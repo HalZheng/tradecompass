@@ -1665,6 +1665,15 @@ def research_rolling(
     tilt: Annotated[
         bool, typer.Option("--tilt/--no-tilt", help="板块组趋势倾斜（MA120 上×1.3、下×0.7）")
     ] = True,
+    switch_tolerance: Annotated[
+        float, typer.Option("--switch-tolerance", help="换股容差：挑战者要比持仓高出多少分才换")
+    ] = 0.0,
+    topup: Annotated[
+        str, typer.Option("--topup", help="加仓模式：off / always / no-deep-loss")
+    ] = "off",
+    topup_priority: Annotated[
+        bool, typer.Option("--topup-priority/--new-buy-priority", help="现金先给加仓还是先给新买")
+    ] = False,
 ) -> None:
     """分板块滚动决策回测：逐日重放“数据 + 交易记录 + 持仓 → 决策”。"""
     import pandas as pd
@@ -1694,7 +1703,12 @@ def research_rolling(
         return
     try:
         panel = load_panel(cfg.paths)
-        engine = RollingEngine(panel, industry, cfg.backtest.costs, slots=slots)
+        engine = RollingEngine(
+            panel, industry, cfg.backtest.costs, slots=slots,
+            switch_tolerance=switch_tolerance,
+            topup=topup.replace("-", "_"),
+            topup_priority=topup_priority,
+        )
         if tilt:
             engine.set_tilt(trend_tilt(group_indices(engine)))
         result = run_rolling(
@@ -1725,11 +1739,155 @@ def research_rolling(
     console.print(f"报告：{escape(str(path))}")
 
 
+@app.command("update")
+def update_data(
+    home: HomeOption = None,
+    start: Annotated[str, typer.Option("--start", help="研究起点 YYYY-MM-DD")] = RESEARCH_START,
+    workers: Annotated[int, typer.Option("--workers", help="个股并发数；8 大约比 4 快一倍")] = 8,
+    as_of: Annotated[
+        str | None, typer.Option("--as-of", help="按哪个日期检查完整性，默认今天")
+    ] = None,
+) -> None:
+    """收盘后一键更新：个股 fast 同步 + ETF/指数（baostock→腾讯降级）+ 完整性检查。
+
+    只更新数据、不生成报告；检查不通过时以退出码 3 结束，`plan` 也会拒绝生成。
+    """
+    from datetime import timedelta
+
+    import pandas as pd
+
+    from tradecompass.research import data as rdata
+    from tradecompass.research import update as rupdate
+    from tradecompass.research.etfs import ETFS
+    from tradecompass.research.weekly_plan import watchlist_from_universe
+
+    try:
+        cfg = load_config(resolve_home(home))
+    except ConfigError as exc:
+        _fail(str(exc))
+        return
+    configure_logging(log_dir=cfg.paths.logs)
+    start_date = pd.Timestamp(start).date()
+    expected = (
+        rupdate.expected_bar_date(pd.Timestamp(as_of).date())
+        if as_of
+        else rupdate.expected_bar_date()
+    )
+    if as_of is None:
+        refusal = rupdate.intraday_refusal(expected)
+        if refusal:
+            _fail(refusal, code=3)
+            return
+    bars_start = start_date - timedelta(days=400)
+
+    members = rdata.load_constituents(cfg.paths)
+    if members.empty:
+        _fail("没有成分快照，先用 baostock 模式跑一次 research sync", code=3)
+        return
+    codes = sorted(set(members["code"]))
+    # 自选票也要保持日线最新，否则打分用的是旧价；它们不参与完整性阻断
+    watch_codes = [
+        rdata.to_bs_code(code)
+        for code in watchlist_from_universe(cfg.paths.config / "universe.yaml")
+    ]
+    codes = sorted(set(codes) | set(watch_codes))
+    etf_codes = sorted(
+        {info.code for info in ETFS}
+        | {
+            f"{inst.market.lower()}.{inst.symbol}"
+            for inst in cfg.universe.instruments
+            if inst.kind.endswith("etf")
+        }
+    )
+    current = rupdate.latest_constituent_codes(cfg.paths)
+    snapshots = sorted((cfg.paths.home / "portfolio" / "eastmoney").glob("holdings_*.csv"))
+    holding_codes: list[str] = []
+    if snapshots:
+        holding_codes = [
+            str(code) for code in pd.read_csv(snapshots[-1], dtype={"code": str})["code"]
+        ]
+    console.print(
+        f"成分股 {len(codes)} 只（当日 {len(current)}）、ETF {len(etf_codes)} 只、"
+        f"持仓 {len(holding_codes)} 只、基准指数 {len(rdata.BENCHMARKS)} 只"
+    )
+
+    def stock_progress(done: int, total: int, failed: int) -> None:
+        if done % 200 == 0 or done == total:
+            console.print(f"  个股 {done}/{total}，失败 {failed}")
+
+    done, stock_failures = rupdate.sync_stocks_fast(
+        cfg.paths, codes, bars_start, workers=workers, progress=stock_progress
+    )
+    relevant = {rdata.to_bs_code(code) for code in [*current, *holding_codes]}
+    critical = [(code, message) for code, message in stock_failures if code in relevant]
+    console.print(
+        f"  个股完成 {done}/{len(codes)}；无行情/估值 {len(stock_failures)} 只"
+        f"（其中当日候选或持仓 {len(critical)} 只）"
+    )
+
+    def etf_progress(done: int, total: int) -> None:
+        if done % 20 == 0 or done == total:
+            console.print(f"  ETF/指数 {done}/{total}")
+
+    etf_done, etf_failures = rupdate.sync_etf_and_index(
+        cfg.paths,
+        etf_codes=etf_codes,
+        index_codes=list(rdata.BENCHMARKS.values()),
+        start=bars_start,
+        end=expected,
+        progress=etf_progress,
+    )
+    console.print(f"  ETF/指数完成 {etf_done}/{len(etf_codes) + len(rdata.BENCHMARKS)}")
+    for item in etf_failures:
+        console.print(f"  ✗ {escape(item)}", style="red")
+
+    for code, message in critical[:10]:
+        console.print(f"  ✗ {code}: {escape(message)}", style="red")
+
+    # 新浪取不到不等于退市（689009 CDR 就是稳定失败）；关键标的改用 baostock 兜底，
+    # 否则一只票会把整份每日报告卡住。baostock 不能并发，只补这几只。
+    if critical:
+
+        def fallback_progress(done: int, total: int) -> None:
+            console.print(f"  baostock 兜底 {done}/{total}")
+
+        fixed, fallback_failures = rupdate.retry_via_baostock(
+            cfg.paths,
+            [code for code, _ in critical],
+            bars_start,
+            expected,
+            progress=fallback_progress,
+        )
+        console.print(f"  baostock 补齐关键标的 {fixed}/{len(critical)}")
+        for code, message in fallback_failures:
+            console.print(f"  ✗ {code} 兜底仍失败: {escape(message)}", style="red")
+
+    completeness = rupdate.check_completeness(
+        cfg.paths,
+        expected=expected,
+        holding_codes=holding_codes,
+        constituent_codes=current,
+    )
+    for line in rupdate.describe(completeness):
+        console.print(line)
+    if not completeness.ok:
+        _fail(
+            f"数据不完整：{len(completeness.blocking)} 只标的缺 {expected} 的 K 线，"
+            "补数后重跑 update，或先确认数据源是否可用",
+            code=3,
+        )
+        return
+    console.print(f"数据完整（截至 {expected}），可以生成提醒：tradecompass plan")
+
+
 @app.command("plan")
 def weekly_plan(
     home: HomeOption = None,
     max_new_buys: Annotated[int, typer.Option("--max-new-buys", help="每个交易日最多新买几只")] = 3,
     slots: Annotated[int, typer.Option("--slots", help="个股名额")] = 12,
+    as_of_date: Annotated[
+        str | None, typer.Option("--as-of", help="按哪个交易日生成（会截断之后的行情），默认今天")
+    ] = None,
 ) -> None:
     """收盘后生成下一交易日操作提醒（真实持仓 + 交易记录 + 滚动策略），只写文件不推送。"""
     import dataclasses
@@ -1743,11 +1901,19 @@ def weekly_plan(
     from tradecompass.research import data as rdata
     from tradecompass.research.etfs import ETFS, etf_roles
     from tradecompass.research.panel import load_panel
-    from tradecompass.research.rolling import RollingEngine, group_indices, trend_tilt
+    from tradecompass.research.rolling import (
+        RollingEngine,
+        group_indices,
+        rules_fingerprint,
+        trend_tilt,
+    )
     from tradecompass.research.weekly_plan import (
         base_targets_from_universe,
         build_plan,
+        plan_payload,
         render_plan,
+        replay_paths,
+        watchlist_from_universe,
     )
 
     try:
@@ -1765,28 +1931,82 @@ def weekly_plan(
     account = yaml.safe_load(accounts[-1].read_text(encoding="utf-8"))
     trades = pd.read_csv(folder / "trades.csv", dtype={"code": str})
     summary = account["summary"]
+    period = account.get("period") or []
+    statement_period = (
+        (pd.Timestamp(period[0]).date(), pd.Timestamp(period[1]).date())
+        if len(period) == 2
+        else None
+    )
+
+    from tradecompass.research import update as rupdate
+
+    # --as-of 是“按哪天的收盘做决策”，不是“只改完整性检查的日期”：
+    # 后面的 panel 必须截断到这一天，否则补算历史会悄悄用上更新（未来）的行情。
+    wanted = (
+        rupdate.expected_bar_date(pd.Timestamp(as_of_date).date())
+        if as_of_date
+        else rupdate.expected_bar_date()
+    )
+    completeness = rupdate.check_completeness(
+        cfg.paths,
+        expected=wanted,
+        holding_codes=[str(code) for code in holdings["code"]],
+        constituent_codes=rupdate.latest_constituent_codes(cfg.paths),
+    )
+    if not completeness.ok:
+        for line in rupdate.describe(completeness):
+            console.print(line)
+        _fail(
+            f"数据不完整：{len(completeness.blocking)} 只标的缺 {completeness.expected} 的 K 线，"
+            "先运行 tradecompass update 补齐后再生成提醒",
+            code=3,
+        )
+        return
+    for gap in completeness.stale:
+        console.print(f"  · {gap.role} {gap.code} 长期停牌/退市，已跳过", style="yellow")
 
     panel = load_panel(cfg.paths)
+    if panel.dates[-1].date() > wanted:
+        try:
+            panel = panel.truncate(wanted)
+        except ValueError as exc:
+            _fail(str(exc), code=3)
+            return
+    if panel.dates[-1].date() < wanted:
+        _fail(
+            f"行情只到 {panel.dates[-1].date()}，够不到 {wanted}；"
+            f"先运行 tradecompass update --as-of {wanted} 补数",
+            code=3,
+        )
+        return
     engine = RollingEngine(panel, rdata.load_industry(cfg.paths), cfg.backtest.costs, slots=slots)
     engine.set_tilt(trend_tilt(group_indices(engine)))
     as_of = panel.dates[-1].date()
+    cut = pd.Timestamp(as_of)
     names = _stock_names(cfg.paths.data / "research" / "names.parquet")
     etf_codes = [e.code for e in ETFS]
     base = base_targets_from_universe(cfg.paths.config / "universe.yaml")
+    watchlist = watchlist_from_universe(cfg.paths.config / "universe.yaml")
     state_path = cfg.paths.home / "portfolio" / "plan_state.json"
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    # ETF 行情、指数与成交流水也要截断到 as_of，否则 --as-of 的均线/状态机仍会用到之后的数据
+    etf_bars = {c: rdata.read_etf_bars(cfg.paths, c).loc[:cut] for c in etf_codes}
+    plan_trades = (
+        trades[pd.to_datetime(trades["date"]).dt.date <= as_of] if as_of_date else trades
+    )
     plan = build_plan(
-        engine, holdings, trades,
+        engine, holdings, plan_trades,
         cash=float(summary["资金可用"]), total_assets=float(summary["总资产"]),
         base_targets=base,
-        etf_bars={c: rdata.read_etf_bars(cfg.paths, c) for c in etf_codes},
+        etf_bars=etf_bars,
         etf_names={e.code: e.name for e in ETFS},
         etf_roles=etf_roles(),
         names=names, max_new_buys=max_new_buys,
         cleanup_since=state.get("cleanup_since", {}),
+        watchlist=watchlist,
     )
 
-    hs300 = rdata.read_index_bars(cfg.paths, rdata.BENCHMARKS["hs300"])
+    hs300 = rdata.read_index_bars(cfg.paths, rdata.BENCHMARKS["hs300"]).loc[:cut]
     points = build_series(hs300) if not hs300.empty else []
     market = (
         f"沪深300 状态机：{points[-1].state.value}（{points[-1].day}），仅作参考——"
@@ -1798,7 +2018,7 @@ def weekly_plan(
     report = analyze(trades)
     closed = pd.DataFrame([dataclasses.asdict(c) for c in report.closed])
     behavior = [
-        f"两年成交 {report.trades} 笔（买 {report.buys} / 卖 {report.sells}），"
+        f"成交 {report.trades} 笔（买 {report.buys} / 卖 {report.sells}），"
         f"涉及 {report.symbols_traded} 个标的；"
         f"同一天买卖同一标的 {report.same_day_round_trips} 次；费用合计 {report.fees:,.0f} 元。",
         f"银行累计转入 {account['totals']['bank_in']:,.0f} 元、未转出；分红净额 "
@@ -1854,15 +2074,21 @@ def weekly_plan(
             + f" 缺 {as_of} 的 K 线，均线按上一交易日计算；现价用对账单价。"
         )
     notes += [
-        "策略研究结论（2026-10-23 回测，2019–2026）：年化约 8.6%、最大回撤约 −18%，优势是回撤小；"
-        "牛市会跑输，样本外仍需实盘验证。不要因为短期表现改规则。",
-        "每个交易日收盘后更新数据并重跑：tradecompass plan；有成交就重新导入对账单（或更新持仓）。",
+        "策略研究结论（2019–2026，12 起点均值）：个股仓位年化约 8.5%、最大回撤约 −18%"
+        "（个股满仓口径，不含底仓 ETF）；优势是回撤小，牛市会跑输，样本外仍需实盘验证。"
+        "不要因为短期表现改规则。",
+        "每个交易日收盘后：tradecompass update 更新数据 → tradecompass plan 出提醒；"
+        "有成交就重新导入对账单（或更新持仓）。",
     ]
-    state_path.write_text(
-        json.dumps({"as_of": str(as_of), "cleanup_since": plan["cleanup_state"]},
-                   ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    replay = as_of_date is not None and as_of != rupdate.expected_bar_date()
+    if replay:
+        console.print("  · 历史复现模式：不写入 plan_state.json，报告写到 plan/replay/ 下")
+    else:
+        state_path.write_text(
+            json.dumps({"as_of": str(as_of), "cleanup_since": plan["cleanup_state"]},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     from datetime import timedelta
 
     from tradecompass.data.calendar import default_calendar
@@ -1871,13 +2097,64 @@ def weekly_plan(
     next_day = default_calendar().next_trading_day(as_of + timedelta(days=1))
     text = render_plan(
         plan, base_targets=base, behavior_lines=behavior, market_line=market, notes=notes,
-        max_new_buys=max_new_buys, next_day=next_day,
+        max_new_buys=max_new_buys, next_day=next_day, statement_period=statement_period,
     )
     directory = cfg.paths.reports / "plan"
+    if replay:
+        path, json_path = replay_paths(directory, next_day, as_of)
+        directory = path.parent
+    else:
+        path = directory / f"{next_day}.md"
+        json_path = directory / f"{next_day}.json"
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{next_day}.md"
+    payload = plan_payload(
+        plan,
+        target_day=next_day,
+        rules_fingerprint=rules_fingerprint(engine.rules),
+        max_new_buys=max_new_buys,
+        statement_period=statement_period,
+    )
+    json_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     path.write_text(text, encoding="utf-8")
-    console.print(f"数据截至 {as_of}，适用 {next_day}；报告：{escape(str(path))}")
+    console.print(
+        f"数据截至 {as_of}，适用 {next_day}；报告：{escape(str(path))}、"
+        f"{escape(str(json_path))}"
+    )
+
+
+@app.command("track")
+def track_advice(home: HomeOption = None) -> None:
+    """回填历史提醒的 T+1/T+5/T+20 表现与是否执行，统计命中率与遵从率。"""
+    import pandas as pd
+
+    from tradecompass.research import tracking
+
+    try:
+        cfg = load_config(resolve_home(home))
+    except ConfigError as exc:
+        _fail(str(exc))
+        return
+    directory = cfg.paths.reports / "plan"
+    plans = tracking.load_history(directory)
+    if not plans:
+        _fail(
+            f"{directory} 下没有结构化提醒（.json）。plan 从本版起会同时落盘，"
+            "下一份提醒生成后即可追踪",
+            code=3,
+        )
+        return
+    trades_path = cfg.paths.home / "portfolio" / "eastmoney" / "trades.csv"
+    trades = pd.read_csv(trades_path, dtype={"code": str}) if trades_path.exists() else None
+    outcomes = []
+    for plan in plans:
+        outcomes.extend(tracking.evaluate_plan(plan, paths=cfg.paths, trades=trades))
+    text = tracking.summarize(outcomes)
+    path = directory / "track.md"
+    path.write_text(text, encoding="utf-8")
+    console.print(text, markup=False)
+    console.print(f"报告：{escape(str(path))}")
 
 
 def _stock_names(cache: Path) -> dict[str, str]:

@@ -12,9 +12,11 @@ from tradecompass.research.rolling import (
     SleeveRule,
     group_indices,
     run_rolling,
+    should_top_up,
     trend_tilt,
 )
 from tradecompass.research.sleeves import sleeve_of
+from tradecompass.research.weekly_plan import build_plan
 
 DAYS = pd.bdate_range("2020-01-01", periods=420)
 RULES = (
@@ -104,6 +106,34 @@ def test_future_data_does_not_change_past_decisions() -> None:
     assert base.equity.loc[: DAYS[cut]].equals(shocked.equity.loc[: DAYS[cut]])
 
 
+def test_panel_truncate_reproduces_history_without_lookahead() -> None:
+    """``plan --as-of`` 的基础：截断到某天后，之前的分数与决策必须与全样本完全一致。"""
+    panel, industry = universe()
+    cut = DAYS[330]
+    trimmed = panel.truncate(cut)
+    assert trimmed.dates[-1] == cut
+    assert trimmed.dates.equals(panel.dates[panel.dates <= cut])
+
+    full_engine = engine(panel, industry)
+    cut_engine = engine(trimmed, industry)
+    for name in full_engine.rules:
+        full_scores = full_engine.scores(
+            full_engine.rules[name], int(panel.dates.searchsorted(cut))
+        )
+        cut_scores = cut_engine.scores(cut_engine.rules[name], len(trimmed.dates) - 1)
+        pd.testing.assert_series_equal(full_scores, cut_scores, check_names=False)
+
+    start = DAYS[260].date()
+    full = run_rolling(full_engine, start, DAYS[-1].date(), capital=100_000)
+    short = run_rolling(cut_engine, start, cut.date(), capital=100_000)
+
+    def key(trade: object) -> tuple:
+        return (trade.day, trade.code, trade.side, trade.shares)  # type: ignore[attr-defined]
+
+    assert [key(t) for t in full.trades if t.day <= cut] == [key(t) for t in short.trades]
+    assert full.equity.loc[:cut].equals(short.equity)
+
+
 def test_zero_quota_never_buys() -> None:
     panel, industry = universe()
     quota = pd.Series(0.0, index=panel.dates)
@@ -111,6 +141,66 @@ def test_zero_quota_never_buys() -> None:
         engine(panel, industry, quota), DAYS[260].date(), DAYS[-1].date(), capital=100_000
     )
     assert not [t for t in result.trades if t.side == "buy"]
+
+
+def test_outsider_is_scored_on_pool_distribution_without_distorting_it() -> None:
+    """池外的自选/持仓要能打分，但不能改变成分股自己的分数（不重拟合截面分布）。"""
+    codes = [f"sh.{600000 + i}" for i in range(40)]
+    outsider = "sh.600999"
+    bars = {c: stock(i) for i, c in enumerate(codes)}
+    bars[outsider] = stock(99)
+    members = pd.DataFrame({"date": DAYS[0], "code": codes, "index": "hs300"})
+    industry = {
+        c: ("J66货币金融服务" if i % 2 else "I65软件和信息技术服务业")
+        for i, c in enumerate(codes)
+    }
+    industry[outsider] = "J66货币金融服务"
+    panel = build_panel(bars, members)
+    eng = RollingEngine(panel, industry, CostsConfig(), rules=RULES, slots=6)
+    i = len(panel.dates) - 1
+    rule = eng.rules["防御"]
+
+    base = eng.scores(rule, i)
+    with_extra = eng.scores(rule, i, extra=[outsider])
+    assert outsider in with_extra.index and outsider not in base.index
+    common = base.index.intersection(with_extra.index)
+    assert len(common) == len(base)
+    assert np.allclose(base.loc[common].to_numpy(), with_extra.loc[common].to_numpy())
+
+
+def test_switch_tolerance_never_increases_selling() -> None:
+    """换股容差是“更不愿意换”，所以卖出次数只会变少、不会变多。"""
+    panel, industry = universe()
+    start, end = DAYS[260].date(), DAYS[-1].date()
+    base = run_rolling(engine(panel, industry), start, end, capital=100_000)
+    patient = RollingEngine(
+        panel, industry, CostsConfig(), rules=RULES, slots=6, switch_tolerance=0.3
+    )
+    slower = run_rolling(patient, start, end, capital=100_000)
+    sells = [t for t in base.trades if t.side == "sell"]
+    slower_sells = [t for t in slower.trades if t.side == "sell"]
+    assert len(slower_sells) <= len(sells)
+    assert RollingEngine(panel, industry, CostsConfig()).switch_tolerance == 0.0
+
+
+def test_should_top_up_respects_mode_and_deep_loss() -> None:
+    """加仓门槛：只在低于目标仓位时补；no_deep_loss 模式不许补深套票。"""
+    assert not should_top_up(5_000, 0.10, "off")
+    assert should_top_up(5_000, 0.10, "always")
+    assert should_top_up(5_000, -0.35, "always")
+    assert should_top_up(5_000, 0.05, "no_deep_loss")
+    assert not should_top_up(5_000, -0.25, "no_deep_loss")
+    assert not should_top_up(0.0, 0.05, "always")
+    assert not should_top_up(-3_000, 0.05, "always")
+
+
+def test_topup_is_off_by_default() -> None:
+    """默认不加仓，回测里不应该凭空多出买单。"""
+    panel, industry = universe()
+    start, end = DAYS[260].date(), DAYS[-1].date()
+    result = run_rolling(engine(panel, industry), start, end, capital=100_000)
+    assert not [t for t in result.trades if "加仓" in t.reason]
+    assert RollingEngine(panel, industry, CostsConfig()).topup == "off"
 
 
 def test_trend_tilt_is_causal_and_shifts_slots() -> None:
@@ -123,7 +213,172 @@ def test_trend_tilt_is_causal_and_shifts_slots() -> None:
     shifted = idx.copy()
     shifted.iloc[300:] *= 0.5
     assert trend_tilt(shifted, ma=60).iloc[:300].equals(tilt.iloc[:300])
+
     eng.set_tilt(pd.DataFrame({"防御": 1.5, "科技成长": 0.5}, index=panel.dates))
     slots = eng.rule_slots(300)
     assert slots["防御"] > slots["科技成长"]
     assert sum(slots.values()) == 6
+
+
+def _plan_universe(*, outsider_st: bool = False) -> tuple[Panel, dict[str, str], str]:
+    """40 只成分（防御/科技各 20）+ 一只“低波+极便宜”的池外自选。"""
+    codes = [f"sh.{600000 + i}" for i in range(40)]
+    outsider = "sh.600999"
+    bars = {c: stock(i) for i, c in enumerate(codes)}
+    calm = stock(99)
+    close = 10.0 * np.cumprod(np.full(len(DAYS), 1.0004))
+    preclose = np.concatenate([[close[0]], close[:-1]])
+    calm["close"] = close
+    calm["preclose"] = preclose
+    calm["open"] = preclose
+    calm["high"] = close * 1.01
+    calm["low"] = close * 0.99
+    calm["pe_ttm"] = 0.001
+    calm["is_st"] = 1.0 if outsider_st else 0.0
+    bars[outsider] = calm
+    members = pd.DataFrame({"date": DAYS[0], "code": codes, "index": "hs300"})
+    industry = {
+        c: ("J66货币金融服务" if i % 2 else "I65软件和信息技术服务业")
+        for i, c in enumerate(codes)
+    }
+    industry[outsider] = "J66货币金融服务"
+    return build_panel(bars, members), industry, outsider
+
+
+def _holding(bs_code: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        [{"code": bs_code[3:], "name": "测试", "price": 10.0, "cost": 10.0,
+          "quantity": 100, "value": 1_000.0}]
+    )
+
+
+def _plan(
+    eng: RollingEngine,
+    holders: list[pd.DataFrame],
+    *,
+    watchlist: list[str] = (),
+    trades: pd.DataFrame | None = None,
+    top_up: bool = False,
+    max_new_buys: int = 0,
+) -> dict[str, object]:
+    empty_trades = pd.DataFrame({"date": [], "code": [], "side": []})
+    frame = (
+        pd.concat(holders)
+        if holders
+        else pd.DataFrame(
+            columns=["code", "name", "price", "cost", "quantity", "value"]
+        )
+    )
+    return build_plan(
+        eng,
+        frame,
+        empty_trades if trades is None else trades,
+        cash=1_000_000.0,
+        total_assets=100_000.0,
+        base_targets={},
+        etf_bars={},
+        etf_names={},
+        names={},
+        max_new_buys=max_new_buys,
+        watchlist=watchlist,
+        top_up=top_up,
+    )
+
+
+def test_holding_keep_line_uses_pool_rank_not_merged_rank() -> None:
+    """自选票可以把持仓的“合并名次”挤出保留线，但保留/清理必须按池内名次判断。"""
+    panel, industry, outsider = _plan_universe()
+    eng = engine(panel, industry)
+    i = len(panel.dates) - 1
+    rule = eng.rules["防御"]
+    pool = eng.scores(rule, i)
+    line = int(np.ceil(eng.rule_slots(i)["防御"] * rule.buffer))
+    keeper = str(pool.index[line - 1])  # 正好在保留线上
+    merged = eng.scores(rule, i, extra=[outsider])
+    assert list(merged.index).index(keeper) + 1 > line  # 确实被自选挤出去了
+
+    plan = _plan(eng, [_holding(keeper)], watchlist=[outsider[3:]])
+    view = plan["views"][0]  # type: ignore[index]
+    assert view.action == "保留"
+    assert f"第 {line} 名" in view.detail
+
+
+def test_plan_holds_recent_buy_even_below_keep_line() -> None:
+    """回测有 min_hold，实盘也必须遵守：刚买两天、名次掉线也不立刻清理。"""
+    panel, industry, _ = _plan_universe()
+    eng = engine(panel, industry)
+    i = len(panel.dates) - 1
+    rule = eng.rules["防御"]
+    loser = str(eng.scores(rule, i).index[-1])
+    trades = pd.DataFrame({"date": [DAYS[i - 2]], "code": [loser[3:]], "side": ["buy"]})
+
+    held = _plan(eng, [_holding(loser)], trades=trades)["views"][0]  # type: ignore[index]
+    assert held.action == "保留"
+    assert "最短持有 5 日" in held.detail
+
+    without_trade = _plan(eng, [_holding(loser)])["views"][0]  # type: ignore[index]
+    assert without_trade.action.startswith("清理")
+
+
+def test_min_hold_uses_position_entry_not_last_buy() -> None:
+    """部分卖出不重置最短持有（引擎的 entry_day 也不重置）；清仓后再买才重置。"""
+    panel, industry, _ = _plan_universe()
+    eng = engine(panel, industry)
+    i = len(panel.dates) - 1
+    loser = str(eng.scores(eng.rules["防御"], i).index[-1])
+    code = loser[3:]
+
+    partial = pd.DataFrame(
+        {
+            "date": [DAYS[i - 60], DAYS[i - 20]],
+            "code": [code, code],
+            "side": ["buy", "sell"],
+            "quantity": [200, 100],
+        }
+    )
+    old_position = _plan(eng, [_holding(loser)], trades=partial)["views"][0]  # type: ignore[index]
+    assert old_position.action.startswith("清理")
+
+    round_trip = pd.DataFrame(
+        {
+            "date": [DAYS[i - 60], DAYS[i - 30], DAYS[i - 2]],
+            "code": [code, code, code],
+            "side": ["buy", "sell", "buy"],
+            "quantity": [200, 200, 100],
+        }
+    )
+    new_position = _plan(eng, [_holding(loser)], trades=round_trip)["views"][0]  # type: ignore[index]
+    assert new_position.action == "保留"
+    assert "最短持有 5 日" in new_position.detail
+
+
+def test_plan_top_up_only_within_group_slots() -> None:
+    """加仓只给组名额以内；缓冲线内的第 4 名（名额 3）不该补到满仓。"""
+    panel, industry, _ = _plan_universe()
+    eng = engine(panel, industry)
+    i = len(panel.dates) - 1
+    rule = eng.rules["防御"]
+    pool = eng.scores(rule, i)
+    slots = eng.rule_slots(i)["防御"]
+    inside = str(pool.index[0])
+    buffer_only = str(pool.index[slots])  # 第 slots+1 名，仍在保留线内
+
+    views = _plan(eng, [_holding(inside), _holding(buffer_only)], top_up=True)["views"]
+    by_code = {view.code: view for view in views}  # type: ignore[union-attr]
+    assert by_code[inside[3:]].add_shares > 0
+    assert by_code[buffer_only[3:]].add_shares == 0
+
+
+def test_watchlist_outsider_is_buyable_unless_st() -> None:
+    """池外自选可以进新买清单，但 ST（以及新股/停牌）必须被挡掉。"""
+    panel, industry, outsider = _plan_universe()
+    ideas = _plan(
+        engine(panel, industry), [], watchlist=[outsider[3:]], max_new_buys=3
+    )["ideas"]
+    assert outsider[3:] in {idea.code for idea in ideas}  # type: ignore[union-attr]
+
+    st_panel, st_industry, st_outsider = _plan_universe(outsider_st=True)
+    st_ideas = _plan(
+        engine(st_panel, st_industry), [], watchlist=[st_outsider[3:]], max_new_buys=3
+    )["ideas"]
+    assert st_outsider[3:] not in {idea.code for idea in st_ideas}  # type: ignore[union-attr]

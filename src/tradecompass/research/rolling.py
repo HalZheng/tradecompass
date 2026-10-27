@@ -14,7 +14,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -24,7 +27,14 @@ import pandas as pd
 from tradecompass.backtest.costs import trade_fee
 from tradecompass.config.models import CostsConfig
 from tradecompass.domain.models import Board
-from tradecompass.research.evaluate import period_returns, rank_ic, rebalance_dates, robust_z
+from tradecompass.research.evaluate import (
+    ZParams,
+    apply_robust_z,
+    fit_robust_z,
+    period_returns,
+    rank_ic,
+    rebalance_dates,
+)
 from tradecompass.research.factors import factor_by_name
 from tradecompass.research.panel import Panel, limit_pct
 from tradecompass.research.sleeves import sleeve_of
@@ -35,6 +45,22 @@ IC_LOOKBACK = 36
 MIN_IC_HISTORY = 12
 PRIOR_WEIGHT = 0.5
 STALE_DAYS = 60
+DEEP_LOSS = -0.20
+"""浮亏超过这个比例就不再补仓——「不补仓摊低」是用户的硬约束（HANDOFF §1.7）。"""
+
+TOPUP_MODES = ("off", "always", "no_deep_loss")
+
+
+def should_top_up(gap: float, ret: float, mode: str) -> bool:
+    """是否该把这只持仓补到目标仓位。
+
+    ``gap`` 是目标仓位减当前市值；``ret`` 是相对建仓成本的收益。
+    ``no_deep_loss`` 模式下浮亏超过 :data:`DEEP_LOSS` 就不补——那是“补仓摊低”，
+    用户的历史毛病，HANDOFF §1.7 明令禁止。
+    """
+    if mode == "off" or gap <= 0:
+        return False
+    return not (mode == "no_deep_loss" and ret <= DEEP_LOSS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +93,29 @@ DEFAULT_RULES: tuple[SleeveRule, ...] = (
         ("rev20", "pv_corr20", "ivol20", "turn20"), period=20, buffer=2.0, min_hold=10,
     ),
 )
+
+
+def rules_fingerprint(rules: Mapping[str, SleeveRule] | None = None) -> str:
+    """板块规则参数指纹（12 位 sha1）。
+
+    事后追踪时用它区分“规则改了”和“市场变了”：同一指纹下的命中率才可横向比较。
+    """
+    source = DEFAULT_RULES if rules is None else tuple(rules.values())
+    payload = {
+        rule.name: {
+            "sleeves": list(rule.sleeves),
+            "factors": list(rule.factors),
+            "period": rule.period,
+            "buffer": rule.buffer,
+            "min_hold": rule.min_hold,
+            "stop_loss": rule.stop_loss,
+        }
+        for rule in sorted(source, key=lambda r: r.name)
+    }
+    digest = hashlib.sha1(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    return digest[:12]
 
 
 @dataclass(slots=True)
@@ -142,12 +191,27 @@ class RollingEngine:
         prior_weight: float = PRIOR_WEIGHT,
         quota: pd.Series | None = None,
         tilt: pd.DataFrame | None = None,
+        switch_tolerance: float = 0.0,
+        topup: str = "off",
+        topup_priority: bool = True,
     ) -> None:
         self.panel = panel
         self.rules = {rule.name: rule for rule in rules}
         self.costs = costs
         self.slots = slots
         self.prior_weight = prior_weight
+        self.switch_tolerance = switch_tolerance
+        """换股容差：持仓掉出缓冲线后，还要有挑战者比它高出这么多分才换。
+
+        组内分在头部极密（前 12 名相邻平均只差 0.035），按名次换股等于拿噪声做决策。
+        0 表示退回纯名次规则（与历史回测一致）。
+        """
+        self.topup = topup
+        """加仓模式：``off`` 不补 / ``always`` 补到目标仓位 / ``no_deep_loss`` 深套不补。"""
+        if topup not in TOPUP_MODES:
+            raise ValueError(f"topup 只能是 {TOPUP_MODES}，收到 {topup!r}")
+        self.topup_priority = topup_priority
+        """现金顺序：True = 加仓优先，False = 新买入优先。"""
         self.quota = (
             quota.reindex(panel.dates).ffill().fillna(1.0).to_numpy(dtype="float64")
             if quota is not None
@@ -187,29 +251,81 @@ class RollingEngine:
             else tilt.reindex(index=self.dates, columns=list(self.rules)).ffill().fillna(1.0)
         )
 
+    @property
+    def tilt_enabled(self) -> bool:
+        """是否启用板块趋势倾斜。报告里必须标出来，否则两份回测数字没法比较。"""
+        return self._tilt is not None
+
     # ---------- 打分 ----------
 
     def _rule_mask(self, rule: SleeveRule, i: int) -> np.ndarray:
         mask: np.ndarray = self.eligible[i] & (self.rule_of_code == rule.name)
         return mask
 
-    def _exposures(self, rule: SleeveRule, i: int) -> pd.DataFrame:
+    def _exposures(
+        self, rule: SleeveRule, i: int, extra: Iterable[str] = ()
+    ) -> pd.DataFrame:
+        """板块组内因子 z 分数。
+
+        ``extra`` 是股票池外的标的（自选、持仓）。它们的 z 分数用**成分股截面拟合出的
+        参数**映射进来，不参与分布拟合——这样既不改变已验证模型的截面分布，
+        又能把池外标的放到同一把尺子上比较。停牌的不算。
+        """
         mask = self._rule_mask(rule, i)
         idx = np.flatnonzero(mask)
         codes = [self.codes[j] for j in idx]
         sleeves = pd.Series(self.sleeve[idx], index=codes)
+        extra_idx = [
+            self.col[code]
+            for code in extra
+            if code in self.col and not mask[self.col[code]] and self.trading[i, self.col[code]]
+        ]
+        extra_codes = [self.codes[j] for j in extra_idx]
         out: dict[str, pd.Series] = {}
         for name in rule.factors:
             values = pd.Series(self.factors[name][i, idx], index=codes)
             values = values.replace([np.inf, -np.inf], np.nan).dropna()
             if len(values) < 10:
                 continue
-            z = robust_z(values * self.expected[name])
+            scaled = values * self.expected[name]
+            params = fit_robust_z(scaled)
+            if params is None:
+                continue
+            z = (scaled.clip(params.low, params.high) - params.mean) / params.std
             if sleeves.nunique() > 1:
                 # 板块组内再按细分板块去均值，避免某一类整体便宜/低波而被集中选中
-                z = z - z.groupby(sleeves.reindex(z.index)).transform("mean")
+                grouped = z.groupby(sleeves.reindex(z.index))
+                z = z - grouped.transform("mean")
+                if extra_codes:
+                    extra_z = self._map_extra(rule, name, i, extra_idx, extra_codes, params)
+                    means = grouped.mean()
+                    offset = [means.get(self.sleeve[j], 0.0) for j in extra_idx]
+                    z = pd.concat([z, extra_z - pd.Series(offset, index=extra_codes)])
+            elif extra_codes:
+                z = pd.concat(
+                    [z, self._map_extra(rule, name, i, extra_idx, extra_codes, params)]
+                )
             out[name] = z
         return pd.DataFrame(out)
+
+    def _map_extra(
+        self,
+        rule: SleeveRule,
+        name: str,
+        i: int,
+        extra_idx: list[int],
+        extra_codes: list[str],
+        params: ZParams,
+    ) -> pd.Series:
+        """把池外标的的因子值映射到成分股截面拟合出的分布上。"""
+        raw = [float(self.factors[name][i, j]) * self.expected[name] for j in extra_idx]
+        return pd.Series([apply_robust_z(v, params) for v in raw], index=extra_codes)
+
+    def exposures(
+        self, rule: SleeveRule, i: int, extra: Iterable[str] = ()
+    ) -> pd.DataFrame:
+        """公开的因子暴露表，供报告解释「这只票为什么在这个位置」。"""
+        return self._exposures(rule, i, extra)
 
     def _monthly_ic(self, rule: SleeveRule) -> list[tuple[int, pd.Series]]:
         """[(实现日下标, 各因子 IC)]；实现日 = 下一个月末的次日开盘。"""
@@ -245,8 +361,11 @@ class RollingEngine:
         )
         return blended
 
-    def scores(self, rule: SleeveRule, i: int) -> pd.Series:
-        expo = self._exposures(rule, i)
+    def scores(self, rule: SleeveRule, i: int, extra: Iterable[str] = ()) -> pd.Series:
+        return self.scores_from(rule, i, self._exposures(rule, i, extra))
+
+    def scores_from(self, rule: SleeveRule, i: int, expo: pd.DataFrame) -> pd.Series:
+        """用已经算好的因子暴露表合成分数，避免同一截面重复计算。"""
         if expo.empty:
             return pd.Series(dtype="float64")
         w = self.weights(rule, i).reindex(expo.columns).fillna(0.0)
@@ -407,16 +526,32 @@ class RollingEngine:
             ranked = self.scores(rule, i)
             if ranked.empty:
                 continue
-            zone = set(ranked.index[: int(math.ceil(n * rule.buffer))])
+            line = min(int(math.ceil(n * rule.buffer)), len(ranked))
+            cut = float(ranked.iloc[line - 1]) - self.switch_tolerance
             keep = [
                 c for c in held
-                if not due or c in zone or i - state.positions[c].entry_day < rule.min_hold
+                if not due
+                or (c in ranked.index and float(ranked.loc[c]) >= cut)
+                or i - state.positions[c].entry_day < rule.min_hold
             ]
             for code in held:
                 if code not in keep:
                     orders.append(Order(code, "sell", name, "排名跌出缓冲区"))
                     selling.add(code)
                     room += state.positions[code].units * self.adj[i, self.col[code]]
+            # 加仓（补到目标仓位）：按组内顺序、现金优先给谁由 topup_priority 决定。
+            # 注意必须留在同一个循环里——拆成两轮会改变 room 的记账顺序，等于改了策略。
+            topups: list[Order] = []
+            if self.topup != "off":
+                for code in keep:
+                    pos = state.positions[code]
+                    gap = slot_value - pos.units * self.adj[i, self.col[code]]
+                    ret = self.adj[i, self.col[code]] / pos.entry_adj - 1.0
+                    if should_top_up(gap, ret, self.topup):
+                        topups.append(Order(code, "buy", name, "加仓补到目标仓位", gap))
+            if self.topup_priority:
+                orders.extend(topups)
+                room -= sum(order.amount for order in topups)
             # 一手买不起的剔除；冷却期内不回补
             max_price = slot_value / LOT
             candidates = [
@@ -430,6 +565,8 @@ class RollingEngine:
                     break
                 orders.append(Order(code, "buy", name, f"{name} 排名入选", slot_value))
                 room -= slot_value
+            if not self.topup_priority:
+                orders.extend(topups)
         return orders
 
     def step(self, state: EngineState, i: int, trades: list[Trade]) -> float:
@@ -544,12 +681,22 @@ def yearly_returns(series: pd.Series) -> dict[int, float]:
 def render_rolling_markdown(
     result: RollingResult, engine: RollingEngine, start: date, end: date, holdout: date
 ) -> str:
+    tilt_state = (
+        "开（板块指数在 MA120 上方 ×1.3、下方 ×0.7）" if engine.tilt_enabled else "关"
+    )
     series = {"策略（扣成本）": result.equity, **result.benchmarks}
     lines = [
         f"# 分板块滚动决策回测  {start} → {end}",
         "",
         f"名额 {engine.slots}；逐日：开盘执行昨日订单 → 收盘估值 → 收盘决策（只用当日及以前数据）。"
         "一手 100 股、真实费率（股票最低 5 元、卖出印花税）、滑点、涨跌停/停牌限制。",
+        "",
+        f"**趋势倾斜：{tilt_state}**——这个状态会显著改变结果，引用数字前先确认。",
+        f"**换股容差：{engine.switch_tolerance:g}**"
+        "（持仓掉出缓冲线后，挑战者要高出这么多分才换；0 = 纯名次规则）。",
+        f"**加仓：{engine.topup}**"
+        f"（现金{'先给加仓' if engine.topup_priority else '先给新买入'}；"
+        "no_deep_loss = 浮亏超过 20% 不补）。",
         "",
         "## 板块规则",
         "",

@@ -52,6 +52,21 @@ class TradingCalendar:
         sessions = cal.sessions_in_range(pd.Timestamp(start), pd.Timestamp(end))
         return [pd.Timestamp(item).date() for item in sessions]
 
+    def sessions(self, start: date, count: int) -> list[date]:
+        """从 ``start``（含）起最多 ``count`` 个交易日。
+
+        日历只覆盖到某一天，未来日期拿不满时返回能取到的部分，不抛异常——
+        回填建议表现时“数据还没到”是常态，不该当成错误。
+        """
+        if count <= 0:
+            return []
+        cal = _calendar()
+        ts = pd.Timestamp(start)
+        if ts < cal.first_session or ts > cal.last_session:
+            return []
+        sessions = cal.sessions_in_range(ts, cal.last_session)
+        return [pd.Timestamp(item).date() for item in sessions[:count]]
+
     def last_trading_day_on_or_before(self, day: date) -> date:
         """含当日：当日是交易日则返回当日，否则返回上一个交易日。"""
         return self.previous_trading_day(day)

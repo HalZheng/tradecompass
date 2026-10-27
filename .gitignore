@@ -10,6 +10,7 @@
 
 # 私有文档 / agent 记忆 / 研究脚本 / 迁移包：不入公开仓库
 .workbuddy/
+.workbuddy-ai/
 discuss records/
 /private_bundle/
 /.private_bundle/

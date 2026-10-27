@@ -47,6 +47,36 @@ class Panel:
     def field(self, name: str) -> pd.DataFrame:
         return self.raw[name]
 
+    def truncate(self, end: date | pd.Timestamp) -> Panel:
+        """只保留 ``end``（含）及以前的行情，用于按历史某天复现决策。
+
+        所有列都是向后看的滚动计算结果，截断后同一日期上的取值不变；
+        ``listed_days`` 是累计计数，截断也不会改变历史值。
+        """
+        cut = pd.Timestamp(end)
+        if cut >= self.dates[-1]:
+            return self
+        if cut < self.dates[0]:
+            raise ValueError(f"{cut.date()} 早于面板起点 {self.dates[0].date()}")
+
+        def trimmed(frame: pd.DataFrame) -> pd.DataFrame:
+            return frame.loc[:cut]
+
+        return Panel(
+            raw={name: trimmed(frame) for name, frame in self.raw.items()},
+            ret=trimmed(self.ret),
+            adj_close=trimmed(self.adj_close),
+            adj_open=trimmed(self.adj_open),
+            adj_high=trimmed(self.adj_high),
+            adj_low=trimmed(self.adj_low),
+            float_mcap=trimmed(self.float_mcap),
+            trading=trimmed(self.trading),
+            st=trimmed(self.st),
+            member=trimmed(self.member),
+            listed_days=trimmed(self.listed_days),
+            buy_blocked=trimmed(self.buy_blocked),
+        )
+
     def eligible(self) -> pd.DataFrame:
         """当日收盘可作为候选：在指数内、正常交易、非 ST、上市满 120 日、次日开盘买得进。"""
         return (

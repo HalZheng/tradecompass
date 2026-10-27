@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import socket
 from collections.abc import Callable, Iterable
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,30 @@ from tradecompass.data.sources import baostock_source
 from tradecompass.data.sources.base import SourceError
 
 log = logging.getLogger(__name__)
+
+MARKET_CLOSE = time(15, 5)
+"""A 股收盘（15:00）后再留 5 分钟给数据源，之前取到的当日 K 线都是半日数据。"""
+
+
+def drop_unclosed_bar(
+    frame: pd.DataFrame, now: datetime | None = None
+) -> pd.DataFrame:
+    """丢掉尚未收盘的当日 K 线。
+
+    盘中取到的“当日 K 线”是半日数据（收盘价=当时价、成交额只有半天）。一旦写进 parquet，
+    ``sync_fast`` 的“日期已是最新就不再拉”会认为它是最新数据，收盘后也不会再修。
+    因此在写入前就丢掉，是最省事也最可靠的一道闸。
+    """
+    if frame.empty:
+        return frame
+    moment = now or datetime.now()
+    if moment.time() >= MARKET_CLOSE:
+        return frame
+    today = pd.Timestamp(moment.date())
+    if today not in frame.index:
+        return frame
+    log.warning("丢弃 %s 未收盘的当日 K 线（盘中数据不落库）", today.date())
+    return frame[frame.index < today]
 
 STOCK_FIELDS = (
     "date,open,high,low,close,preclose,volume,amount,turn,tradestatus,pctChg,isST,"
@@ -50,6 +74,16 @@ BAOSTOCK_TIMEOUT = 60.0
 
 def research_dir(paths: Paths) -> Path:
     return paths.data / "research"
+
+
+def to_bs_code(code: str) -> str:
+    """6 位代码 → baostock 风格：``600000`` → ``sh.600000``，``000001`` → ``sz.000001``。
+
+    沪市 5/6/9 开头（含 688 科创板、5 开头的 ETF），其余归深市；已带前缀的原样返回。
+    """
+    if "." in code:
+        return code
+    return ("sh." if code[0] in "569" else "sz.") + code
 
 
 def constituents_path(paths: Paths) -> Path:
@@ -114,6 +148,7 @@ def append_from_tencent(path: Path, code: str, end: date, *, index: bool = False
     new["preclose"] = closes.shift(1).loc[new.index]
     new["pct_chg"] = (new["close"] / new["preclose"] - 1.0) * 100.0
     merged = pd.concat([old, new.reindex(columns=old.columns)]).sort_index()
+    merged = drop_unclosed_bar(merged)
     merged.to_parquet(path)
     return len(new)
 
@@ -280,7 +315,11 @@ def read_valuation(paths: Paths, code: str) -> pd.DataFrame:
 
 
 def sync_fast(paths: Paths, code: str, start: date) -> str:
-    """刷新东财估值，并用新浪补齐/追加日线。返回 "bars" / "append" / "valuation"。"""
+    """刷新东财估值，并用新浪补齐/追加日线。返回 "bars" / "append" / "valuation"。
+
+    写入前会丢掉未收盘的当日 K 线；存量数据里如果已经有这样一根，也会被剔除，
+    避免“半日 K 线落库后因为日期已是最新而永远不修”。
+    """
     from tradecompass.research.fast_source import fetch_fast, fetch_valuation
 
     valuation = fetch_valuation(code)
@@ -289,9 +328,13 @@ def sync_fast(paths: Paths, code: str, start: date) -> str:
     valuation.to_parquet(path)
     bars_path = stock_bars_path(paths, code)
     old = pd.read_parquet(bars_path) if bars_path.exists() else pd.DataFrame()
+    healed = drop_unclosed_bar(old)
+    if not healed.equals(old):
+        old = healed
+        old.to_parquet(bars_path)
     if not old.empty and not valuation.empty and old.index.max() >= valuation.index.max():
         return "valuation"
-    bars = fetch_fast(code, start, valuation)
+    bars = drop_unclosed_bar(fetch_fast(code, start, valuation))
     if bars.empty:
         raise SourceError(f"新浪 {code} 无日线")
     bars_path.parent.mkdir(parents=True, exist_ok=True)
