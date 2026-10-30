@@ -11,6 +11,7 @@ import pandas as pd
 from tradecompass.account.behavior import analyze
 from tradecompass.research.etfs import etf_by_code, etf_roles, strategy_of
 from tradecompass.research.weekly_plan import (
+    BaseOrder,
     BuyIdea,
     HoldingView,
     WatchView,
@@ -23,9 +24,11 @@ from tradecompass.research.weekly_plan import (
     apply_patience,
     base_orders,
     etf_action,
+    last_month_end,
     plan_payload,
     render_plan,
     replay_paths,
+    split_cash,
     steady_targets_from_universe,
 )
 
@@ -166,11 +169,18 @@ def _empty_plan(as_of: date) -> dict[str, object]:
         "slot_value": 10_116.0,
         "stock_capital": 121_387.0,
         "stock_share": 0.4,
+        "stock_value": 0.0,
+        "stock_budget": 18_288.0,
+        "base_budget": 0.0,
+        "steady_budget": 0.0,
         "steady_targets": {},
         "cash": 18_288.0,
         "total_assets": 242_774.0,
         "sold_recently": [],
         "cleanup_state": {},
+        "rebalance_state": {},
+        "due_by_rule": {"防御": True},
+        "steady_orders": {},
         "etf_stale": [],
         "base_orders": [],
     }
@@ -378,15 +388,23 @@ def test_report_shows_etf_position_band_but_not_auto_orders() -> None:
 
 def test_etf_target_order_rounds_to_lots_and_caps_sell() -> None:
     """稳健 ETF 的目标缺口翻成整手建议：减仓不超过持有，差不到一手不动。"""
-    target, gap, order = _etf_target_order(9_000, 5_000, 1.0, 5_000)
-    assert target == 9_000 and gap == 4_000
+    target, gap, lots, order = _etf_target_order(9_000, 5_000, 1.0, 5_000)
+    assert target == 9_000 and gap == 4_000 and lots == 4_000
     assert order == "加 4,000 份（约 4,000 元）"
-    _, gap, order = _etf_target_order(5_000, 12_000, 1.0, 12_000)
-    assert gap == -7_000 and order.startswith("减 7,000 份")
-    _, _, order = _etf_target_order(1_000, 12_000, 1.0, 500)
-    assert order.startswith("减 500 份")
-    assert _etf_target_order(10_050, 10_000, 1.0, 10_000)[2] == "差不足一手，攒够再加"
-    assert _etf_target_order(10_000, 10_050, 1.0, 10_050)[2] == "超配不足一手，暂不动"
+    _, gap, lots, order = _etf_target_order(5_000, 12_000, 1.0, 12_000)
+    assert gap == -7_000 and lots == -7_000 and order.startswith("减 7,000 份")
+    _, _, lots, order = _etf_target_order(1_000, 12_000, 1.0, 500)
+    assert lots == -500 and order.startswith("减 500 份")
+    assert _etf_target_order(10_050, 10_000, 1.0, 10_000)[3] == "差不足一手，攒够再加"
+    assert _etf_target_order(10_000, 10_050, 1.0, 10_050)[3] == "超配不足一手，暂不动"
+
+
+def test_etf_target_order_respects_cash_budget() -> None:
+    """加仓建议不能超过本次留给稳健 ETF 的现金。"""
+    _, _, lots, order = _etf_target_order(9_000, 5_000, 1.0, 5_000, budget=2_500)
+    assert lots == 2_500 and "现金不足" not in order
+    _, _, lots, order = _etf_target_order(9_000, 5_000, 1.0, 5_000, budget=50)
+    assert lots == 0 and "现金不足" in order
 
 
 def test_steady_targets_from_universe(tmp_path) -> None:
@@ -506,6 +524,24 @@ def test_conclusion_says_how_many_are_actually_affordable() -> None:
     assert "实际只够 **2 只**" in text and "还差 1 只的钱" in text
 
 
+def test_conclusion_says_when_stock_sleeve_is_overweight() -> None:
+    """个股超过 40% 时不能再说“最多买 3 只”，要直接说本次不新买。"""
+    as_of = date(2026, 3, 5)
+    plan = _empty_plan(as_of)
+    plan["stock_value"] = 140_000.0
+    plan["stock_budget"] = 0.0
+    text = render_plan(
+        plan,
+        base_targets={"510300": 0.5},
+        behavior_lines=["x"],
+        market_line="m",
+        notes=["n"],
+        next_day=date(2026, 3, 6),
+        statement_period=(date(2024, 1, 2), as_of),
+    )
+    assert "个股已超配" in text and "现 58%" in text and "本次不新买" in text
+
+
 def test_cleanup_summary_shows_resulting_portfolio() -> None:
     """清理不是“卖完就完了”，要说清卖完之后组合长什么样。"""
     as_of = date(2026, 3, 5)
@@ -523,7 +559,7 @@ def test_cleanup_summary_shows_resulting_portfolio() -> None:
         next_day=date(2026, 3, 6),
         statement_period=(date(2024, 1, 2), as_of),
     )
-    assert "清理完成后" in text and "个股持仓会从 2 只降到 1 只" in text
+    assert "清理完成后" in text and "个股会先剩 1 只" in text and "补到 3 个名额" in text
 
 
 def test_plan_payload_carries_score() -> None:
@@ -567,7 +603,72 @@ def test_plan_payload_is_serialisable_and_keeps_basis() -> None:
     assert payload["schema"] == 1
     assert payload["target_day"] == "2026-03-06"
     assert payload["statement_period"] == ["2024-01-02", "2026-03-05"]
-    assert payload["rules"] == {"fingerprint": "abc123", "max_new_buys": 3}
+    assert payload["rules"] == {"fingerprint": "abc123", "max_new_buys": 3, "topup": "off"}
     holding = payload["holdings"][0]  # type: ignore[index]
     assert holding["action"] == "清理：反弹分批" and holding["ma10"] == 10.5
     assert payload["buys"][0]["code"] == "000157"  # type: ignore[index]
+
+
+def test_last_month_end_is_the_previous_month_until_month_end() -> None:
+    """仓位带固定在月末：10 月中的任何一天都用 09-30 的系数，10-30 才换成本月。"""
+    assert last_month_end(date(2026, 10, 1)) == date(2026, 9, 30)
+    assert last_month_end(date(2026, 10, 26)) == date(2026, 9, 30)
+    assert last_month_end(date(2026, 9, 30)) == date(2026, 9, 30)
+    assert last_month_end(date(2026, 10, 31)) == date(2026, 10, 30)
+
+
+def test_split_cash_half_to_base_and_half_to_stocks() -> None:
+    """底仓有缺口时一半补底仓、一半给个股；个股买不了的钱回给底仓。"""
+    base, stock, steady = split_cash(
+        20_000, base_gap=50_000, steady_gap=0, stock_cap_room=40_000
+    )
+    assert (base, stock, steady) == (10_000, 10_000, 0)
+
+    # 稳健 ETF 先留，再按一半分
+    base, stock, steady = split_cash(
+        20_000, base_gap=50_000, steady_gap=1_000, stock_cap_room=40_000
+    )
+    assert steady == 1_000 and base == 9_500 and stock == 9_500
+
+    # 个股超配：一半也归底仓
+    base, stock, steady = split_cash(
+        20_000, base_gap=50_000, steady_gap=0, stock_cap_room=0
+    )
+    assert (base, stock, steady) == (20_000, 0, 0)
+
+    # 底仓缺口小于一半：底仓只拿缺口，剩下的给个股
+    base, stock, steady = split_cash(
+        20_000, base_gap=5_000, steady_gap=0, stock_cap_room=40_000
+    )
+    assert base == 5_000 and stock == 15_000
+
+    # 底仓已达标：现金全给个股（受上限约束）
+    base, stock, steady = split_cash(
+        20_000, base_gap=0, steady_gap=0, stock_cap_room=40_000
+    )
+    assert (base, stock, steady) == (0, 20_000, 0)
+
+
+def test_payload_records_base_and_steady_orders() -> None:
+    """底仓/稳健建议是最大的一类建议，必须进 JSON，track 才能核对是否执行。"""
+    plan = _empty_plan(date(2026, 3, 5))
+    plan["base_orders"] = [
+        BaseOrder(
+            "510300", 0.5, 0.6, 36_416.0, 6_685.0, 29_731.0, 4.178, 4.263,
+            400, 1_705.2, 800, 3_410.4, 426.3, 3_410.4, 2, 7_000,
+        )
+    ]
+    plan["steady_orders"] = {
+        "513910": (7_283.0, 1_219.0, 800, "加 800 份（约 1,213 元）")
+    }
+    payload = plan_payload(
+        plan,
+        target_day=date(2026, 3, 6),
+        rules_fingerprint="abc123",
+        max_new_buys=3,
+    )
+    base = payload["base_orders"][0]  # type: ignore[index]
+    assert base["code"] == "510300" and base["amount"] == 1_705.2
+    steady = payload["steady_orders"][0]  # type: ignore[index]
+    assert steady["code"] == "513910" and steady["lots"] == 800
+    assert payload["account"]["stock_budget"] == 18_288.0  # type: ignore[index]

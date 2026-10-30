@@ -8,9 +8,13 @@ import pandas as pd
 from tradecompass.config.models import CostsConfig
 from tradecompass.research.panel import Panel, build_panel
 from tradecompass.research.rolling import (
+    CleanupState,
+    EngineState,
+    Position,
     RollingEngine,
     SleeveRule,
     group_indices,
+    half_lot,
     run_rolling,
     should_top_up,
     trend_tilt,
@@ -67,8 +71,24 @@ def universe(shock_from: int | None = None) -> tuple[Panel, dict[str, str]]:
     return build_panel(bars, members), industry
 
 
-def engine(panel: Panel, industry: dict[str, str], quota: pd.Series | None = None) -> RollingEngine:
-    return RollingEngine(panel, industry, CostsConfig(), rules=RULES, slots=6, quota=quota)
+def engine(
+    panel: Panel,
+    industry: dict[str, str],
+    quota: pd.Series | None = None,
+    *,
+    cleanup: str = "immediate",
+    cash_rate: float = 0.0,
+) -> RollingEngine:
+    return RollingEngine(
+        panel,
+        industry,
+        CostsConfig(),
+        rules=RULES,
+        slots=6,
+        quota=quota,
+        cleanup=cleanup,
+        cash_rate=cash_rate,
+    )
 
 
 def test_sleeve_mapping() -> None:
@@ -77,6 +97,24 @@ def test_sleeve_mapping() -> None:
     assert sleeve_of("C27医药制造业") == "医药"
     assert sleeve_of("C26化学原料和化学制品制造业") == "周期资源"
     assert sleeve_of(None) == "其他"
+
+
+def test_default_cash_rate_is_zero() -> None:
+    panel, industry = universe()
+    assert RollingEngine(panel, industry, CostsConfig()).cash_rate == 0.0
+
+
+def test_cash_rate_accrues_on_idle_cash() -> None:
+    panel, industry = universe()
+    quota = pd.Series(0.0, index=panel.dates)
+    eng = RollingEngine(
+        panel, industry, CostsConfig(), rules=RULES, slots=6, quota=quota, cash_rate=0.02
+    )
+    state = EngineState(cash=100_000.0)
+    for i in range(244):
+        eng.step(state, i, [])
+    assert state.positions == {}
+    assert abs(state.cash - 102_000.0) < 10.0
 
 
 def test_orders_fill_next_open_in_lots() -> None:
@@ -104,6 +142,100 @@ def test_future_data_does_not_change_past_decisions() -> None:
 
     assert upto(base.trades) == upto(shocked.trades)
     assert base.equity.loc[: DAYS[cut]].equals(shocked.equity.loc[: DAYS[cut]])
+
+
+def test_default_cleanup_is_immediate() -> None:
+    panel, industry = universe()
+    assert RollingEngine(panel, industry, CostsConfig()).cleanup == "immediate"
+
+
+def test_half_lot_rounds_to_board_lot() -> None:
+    assert half_lot(1000) == 500
+    assert half_lot(150) == 150  # 不足两手，全卖
+    assert half_lot(250) == 100  # 取整到一手
+
+
+def test_rebound_cleanup_does_not_look_ahead() -> None:
+    cut = 330
+    base_panel, industry = universe()
+    shocked_panel, _ = universe(shock_from=cut + 1)
+    start, end = DAYS[260].date(), DAYS[-1].date()
+    base = run_rolling(
+        engine(base_panel, industry, cleanup="rebound"), start, end, capital=100_000
+    )
+    shocked = run_rolling(
+        engine(shocked_panel, industry, cleanup="rebound"), start, end, capital=100_000
+    )
+
+    def upto(trades: list) -> list[tuple]:
+        return [(t.day, t.code, t.side, t.shares) for t in trades if t.day <= DAYS[cut]]
+
+    assert upto(base.trades) == upto(shocked.trades)
+    assert base.equity.loc[: DAYS[cut]].equals(shocked.equity.loc[: DAYS[cut]])
+
+
+def test_rebound_cleanup_sells_at_ma_or_patience() -> None:
+    panel, industry = universe()
+    eng = engine(panel, industry, cleanup="rebound")
+    j = eng.col["sh.600000"]
+    candidates = np.flatnonzero(
+        np.isfinite(eng.high[:, j])
+        & np.isfinite(eng.ma10[:, j])
+        & (eng.high[:, j] >= eng.ma10[:, j])
+    )
+    i = int(candidates[-1])
+    code = "sh.600000"
+    state = EngineState(
+        cash=0.0,
+        positions={
+            code: Position(
+                code,
+                "防御",
+                units=1000.0,
+                entry_adj=float(eng.adj[i - 5, j]),
+                entry_day=i - 5,
+            )
+        },
+        cleanup={code: CleanupState(start=i - 5)},
+    )
+    trades: list = []
+    eng.cleanup_exits(state, i, trades)
+    assert trades and trades[0].reason.startswith("清理")
+    assert state.cash > 0 or code not in state.positions
+
+
+def test_rebound_cleanup_patience_sells_once() -> None:
+    panel, industry = universe()
+    eng = engine(panel, industry, cleanup="rebound")
+    j = eng.col["sh.600000"]
+    candidates = np.flatnonzero(
+        np.isfinite(eng.high[:, j])
+        & np.isfinite(eng.ma10[:, j])
+        & np.isfinite(eng.ma20[:, j])
+        & (eng.high[:, j] < eng.ma10[:, j])
+        & (eng.high[:, j] < eng.ma20[:, j])
+    )
+    i = int(candidates[-1])
+    code = "sh.600000"
+    state = EngineState(
+        cash=0.0,
+        positions={
+            code: Position(
+                code,
+                "防御",
+                units=1000.0,
+                entry_adj=float(eng.adj[i - 1, j]),
+                entry_day=i - 10,
+            )
+        },
+        cleanup={code: CleanupState(start=i - 10)},
+    )
+    trades: list = []
+    eng.cleanup_exits(state, i, trades)
+    assert len(trades) == 1 and trades[0].reason == "清理：到期卖半"
+    # 余下继续等 MA20；不会第二天再卖一半
+    eng.cleanup_exits(state, i, trades)
+    assert len(trades) == 1
 
 
 def test_panel_truncate_reproduces_history_without_lookahead() -> None:
@@ -252,6 +384,13 @@ def _holding(bs_code: str) -> pd.DataFrame:
     )
 
 
+def _holding_value(bs_code: str, value: float) -> pd.DataFrame:
+    return pd.DataFrame(
+        [{"code": bs_code[3:], "name": "测试", "price": 10.0, "cost": 10.0,
+          "quantity": int(value / 10.0), "value": value}]
+    )
+
+
 def _plan(
     eng: RollingEngine,
     holders: list[pd.DataFrame],
@@ -260,6 +399,9 @@ def _plan(
     trades: pd.DataFrame | None = None,
     top_up: bool = False,
     max_new_buys: int = 0,
+    cash: float = 1_000_000.0,
+    last_rebalance: dict[str, str] | None = None,
+    cleanup_since: dict[str, str] | None = None,
 ) -> dict[str, object]:
     empty_trades = pd.DataFrame({"date": [], "code": [], "side": []})
     frame = (
@@ -273,7 +415,7 @@ def _plan(
         eng,
         frame,
         empty_trades if trades is None else trades,
-        cash=1_000_000.0,
+        cash=cash,
         total_assets=100_000.0,
         base_targets={},
         etf_bars={},
@@ -282,6 +424,8 @@ def _plan(
         max_new_buys=max_new_buys,
         watchlist=watchlist,
         top_up=top_up,
+        last_rebalance=last_rebalance,
+        cleanup_since=cleanup_since,
     )
 
 
@@ -354,8 +498,8 @@ def test_min_hold_uses_position_entry_not_last_buy() -> None:
     assert "最短持有 5 日" in new_position.detail
 
 
-def test_plan_top_up_only_within_group_slots() -> None:
-    """加仓只给组名额以内；缓冲线内的第 4 名（名额 3）不该补到满仓。"""
+def test_plan_top_up_follows_backtest_keep_scope() -> None:
+    """加仓与回测同口径：保留线内都能补；现金按排名先给前面的，排不上退回保留。"""
     panel, industry, _ = _plan_universe()
     eng = engine(panel, industry)
     i = len(panel.dates) - 1
@@ -368,7 +512,16 @@ def test_plan_top_up_only_within_group_slots() -> None:
     views = _plan(eng, [_holding(inside), _holding(buffer_only)], top_up=True)["views"]
     by_code = {view.code: view for view in views}  # type: ignore[union-attr]
     assert by_code[inside[3:]].add_shares > 0
-    assert by_code[buffer_only[3:]].add_shares == 0
+    # 保留线以内（缓冲区内）也算保留，回测的加仓范围就是 keep，不再额外要求前 slots 名
+    assert by_code[buffer_only[3:]].add_shares > 0
+
+    # 现金只够补一只时，按排名先给第 1 名
+    tight = _plan(
+        eng, [_holding(inside), _holding(buffer_only)], top_up=True, cash=3_000
+    )["views"]
+    tight_by = {view.code: view for view in tight}  # type: ignore[union-attr]
+    assert tight_by[inside[3:]].add_shares > 0
+    assert tight_by[buffer_only[3:]].add_shares == 0
 
 
 def test_watchlist_outsider_is_buyable_unless_st() -> None:
@@ -386,3 +539,48 @@ def test_watchlist_outsider_is_buyable_unless_st() -> None:
         engine(st_panel, st_industry), [], watchlist=[st_outsider[3:]], max_new_buys=3
     )["ideas"]
     assert st_outsider[3:] not in {idea.code for idea in st_ideas}  # type: ignore[union-attr]
+
+
+def test_plan_only_rebalances_on_due_days() -> None:
+    """plan 与回测同节奏：未到调仓日不清理，到期才重排。"""
+    panel, industry, _ = _plan_universe()
+    eng = engine(panel, industry)
+    i = len(panel.dates) - 1
+    loser = str(eng.scores(eng.rules["防御"], i).index[-1])
+
+    recent = _plan(
+        eng, [_holding(loser)], last_rebalance={"防御": DAYS[i].date().isoformat()}
+    )["views"][0]  # type: ignore[index]
+    assert recent.action == "保留" and "未到调仓日" in recent.detail
+
+    overdue = _plan(
+        eng, [_holding(loser)], last_rebalance={"防御": DAYS[i - 60].date().isoformat()}
+    )["views"][0]  # type: ignore[index]
+    assert overdue.action.startswith("清理")
+
+
+def test_cleanup_persists_until_next_rebalance() -> None:
+    """已进入清理的持仓，在非调仓日继续挂条件单，不会因为当天没重排就变回“保留”。"""
+    panel, industry, _ = _plan_universe()
+    eng = engine(panel, industry)
+    i = len(panel.dates) - 1
+    loser = str(eng.scores(eng.rules["防御"], i).index[-1])
+    view = _plan(
+        eng,
+        [_holding(loser)],
+        last_rebalance={"防御": DAYS[i].date().isoformat()},
+        cleanup_since={loser[3:]: DAYS[i - 3].date().isoformat()},
+    )["views"][0]  # type: ignore[index]
+    assert view.action.startswith("清理") and "继续挂条件单" in view.detail
+
+
+def test_plan_never_buys_when_stock_sleeve_is_over_cap() -> None:
+    """个股超过 40% 上限时，新买额度必须是 0；不能一边超配一边加股票。"""
+    panel, industry, _ = _plan_universe()
+    eng = engine(panel, industry)
+    i = len(panel.dates) - 1
+    winner = str(eng.scores(eng.rules["防御"], i).index[0])  # 保留线内，不会卖出
+    plan = _plan(eng, [_holding_value(winner, 50_000.0)], max_new_buys=3)
+    assert plan["stock_cap_room"] == 0
+    assert plan["stock_budget"] == 0
+    assert plan["ideas"] == []

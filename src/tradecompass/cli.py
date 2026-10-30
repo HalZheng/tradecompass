@@ -1885,6 +1885,12 @@ def weekly_plan(
     home: HomeOption = None,
     max_new_buys: Annotated[int, typer.Option("--max-new-buys", help="每个交易日最多新买几只")] = 3,
     slots: Annotated[int, typer.Option("--slots", help="个股名额")] = 12,
+    topup: Annotated[
+        str,
+        typer.Option(
+            "--topup", help="加仓模式：off / always / no-deep-loss（默认 off，与回测基线一致）"
+        ),
+    ] = "off",
     as_of_date: Annotated[
         str | None, typer.Option("--as-of", help="按哪个交易日生成（会截断之后的行情），默认今天")
     ] = None,
@@ -1899,7 +1905,7 @@ def weekly_plan(
     from tradecompass.account.behavior import analyze
     from tradecompass.market.regime import build_series
     from tradecompass.research import data as rdata
-    from tradecompass.research.etfs import ETFS, etf_roles
+    from tradecompass.research.etfs import ETF_BAND, ETFS, etf_roles
     from tradecompass.research.panel import load_panel
     from tradecompass.research.rolling import (
         RollingEngine,
@@ -1908,6 +1914,10 @@ def weekly_plan(
         trend_tilt,
     )
     from tradecompass.research.weekly_plan import (
+        BASE_SHARE_OF_ASSETS,
+        CLEANUP_PATIENCE,
+        DEEP_LOSS,
+        STOCK_SHARE_OF_ASSETS,
         base_targets_from_universe,
         build_plan,
         plan_payload,
@@ -2007,7 +2017,9 @@ def weekly_plan(
         steady_targets=steady,
         names=names, max_new_buys=max_new_buys,
         cleanup_since=state.get("cleanup_since", {}),
+        last_rebalance=state.get("last_rebalance", {}),
         watchlist=watchlist,
+        topup=topup.replace("-", "_"),
     )
 
     hs300 = rdata.read_index_bars(cfg.paths, rdata.BENCHMARKS["hs300"]).loc[:cut]
@@ -2089,8 +2101,15 @@ def weekly_plan(
         console.print("  · 历史复现模式：不写入 plan_state.json，报告写到 plan/replay/ 下")
     else:
         state_path.write_text(
-            json.dumps({"as_of": str(as_of), "cleanup_since": plan["cleanup_state"]},
-                       ensure_ascii=False, indent=2),
+            json.dumps(
+                {
+                    "as_of": str(as_of),
+                    "cleanup_since": plan["cleanup_state"],
+                    "last_rebalance": plan["rebalance_state"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
     from datetime import timedelta
@@ -2114,7 +2133,20 @@ def weekly_plan(
     payload = plan_payload(
         plan,
         target_day=next_day,
-        rules_fingerprint=rules_fingerprint(engine.rules),
+        rules_fingerprint=rules_fingerprint(
+            engine.rules,
+            extra={
+                "base_share": BASE_SHARE_OF_ASSETS,
+                "stock_share": STOCK_SHARE_OF_ASSETS,
+                "deep_loss": DEEP_LOSS,
+                "cleanup_patience": CLEANUP_PATIENCE,
+                "max_new_buys": max_new_buys,
+                "topup": topup.replace("-", "_"),
+                "band": {
+                    name: dataclasses.asdict(params) for name, params in ETF_BAND.items()
+                },
+            },
+        ),
         max_new_buys=max_new_buys,
         statement_period=statement_period,
     )
@@ -2129,7 +2161,12 @@ def weekly_plan(
 
 
 @app.command("track")
-def track_advice(home: HomeOption = None) -> None:
+def track_advice(
+    home: HomeOption = None,
+    since: str = typer.Option(
+        "", "--since", help="只统计该建议日及以后（YYYY-MM-DD），用于真样本外"
+    ),
+) -> None:
     """回填历史提醒的 T+1/T+5/T+20 表现与是否执行，统计命中率与遵从率。"""
     import pandas as pd
 
@@ -2140,8 +2177,13 @@ def track_advice(home: HomeOption = None) -> None:
     except ConfigError as exc:
         _fail(str(exc))
         return
+    try:
+        since_date = date.fromisoformat(since) if since else None
+    except ValueError:
+        _fail(f"--since 日期格式应为 YYYY-MM-DD：{since}")
+        return
     directory = cfg.paths.reports / "plan"
-    plans = tracking.load_history(directory)
+    plans = tracking.load_history(directory, since=since_date)
     if not plans:
         _fail(
             f"{directory} 下没有结构化提醒（.json）。plan 从本版起会同时落盘，"

@@ -15,13 +15,14 @@ import dataclasses
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import cast
 
 import numpy as np
 import pandas as pd
 
+from tradecompass.data.calendar import TradingCalendar, default_calendar
 from tradecompass.research import data as rdata
 from tradecompass.research.data import read_etf_bars
 from tradecompass.research.etfs import (
@@ -32,7 +33,15 @@ from tradecompass.research.etfs import (
     strategy_of,
 )
 from tradecompass.research.factors import factor_by_name
-from tradecompass.research.rolling import LOT, RollingEngine, group_indices
+from tradecompass.research.rolling import (
+    LOT,
+    TOPUP_MODES,
+    RollingEngine,
+    SleeveDecision,
+    SleeveHolding,
+    group_indices,
+    sleeve_decide,
+)
 
 BUY_LIMIT_MARKUP = 0.02
 COOLDOWN_TRADING_DAYS = 20
@@ -45,6 +54,24 @@ STOCK_SHARE_OF_ASSETS = 0.4
 BASE_BUDGET_UNIT = 10_000.0
 BASE_REBALANCE_SHARE = 0.5
 """清理回笼资金里用于补底仓的比例；HANDOFF §4：回笼资金一半按差额补。"""
+STOCK_CASH_SHARE = 1.0 - BASE_REBALANCE_SHARE
+"""底仓缺口没补满时，剩下的现金一半给个股；个股超配时这一半也归底仓。"""
+
+
+def last_month_end(day: date, calendar: TradingCalendar | None = None) -> date:
+    """``day`` 当日或之前最近的月末交易日。
+
+    仓位带是**月末调仓**的规则（研究口径）；实盘每天重算，但系数必须固定在最近一个
+    月末，否则 29→30 这种阈值抖动会让目标金额每天来回跳。
+    """
+    cal = calendar or default_calendar()
+    current = cal.last_trading_day_on_or_before(day)
+    for _ in range(40):
+        following = cal.next_trading_day(current + timedelta(days=1))
+        if following.month != current.month:
+            return current
+        current = cal.previous_trading_day(current - timedelta(days=1))
+    return current
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +103,7 @@ class HoldingView:
     asset_class: str = ""
     """ETF 资产类别（equity_broad/equity_value/sector/overseas/...）；股票为空。"""
     strategy: str = ""
-    """ETF 策略族（core_band/core_band_high_floor/hold/swing_cleanup）；股票为空。"""
+    """ETF 策略族（core_band/hold/swing_cleanup）；股票为空。"""
     etf_position: float | None = None
     """ETF 现价在过去 250 日高低区间的位置（0–100）；只对仓位带类 ETF 计算。"""
     etf_band: float | None = None
@@ -89,6 +116,8 @@ class HoldingView:
     """目标市值 - 现有市值；正数要加、负数要减。"""
     etf_order: str = ""
     """按整手给出的买卖建议，如“加 800 份”“减 3,800 份”；只建议，不自动下单。"""
+    etf_lots: int = 0
+    """带符号的整手份数：正数加、负数减、0 不动。用于落盘与事后核对。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,17 +207,27 @@ def _etf_trend_strength(bars: pd.DataFrame) -> float | None:
 
 
 def _etf_position_band(
-    bars: pd.DataFrame, strategy: str
+    bars: pd.DataFrame,
+    strategy: str,
+    *,
+    as_of: pd.Timestamp | None = None,
+    label: str = "",
 ) -> tuple[float, bool, float, str] | None:
     """ETF 仓位带：按 250 日价格位置给“相对目标仓位”的系数。
 
-    只用于 ``core_band``（宽基/红利/海外）和 ``core_band_high_floor``（黄金）：
+    只用于 ``core_band``（宽基/红利/海外）：
     - 高位减、低位止跌后加回，始终保留核心；空出的钱是现金，不加杠杆；
     - 低位“止跌”是确认（收盘≥MA20 或 5 日收益>0），不是预测反弹概率；
-    - 只建议、不自动下单；债券/行业 ETF 不适用。
+    - ``as_of`` 用来把系数固定在最近一个月末：研究是月末调仓，实盘每天重算时
+      必须用同一份月末快照，否则 29/30 这种阈值会让目标金额每天跳几十个百分点；
+    - 只建议、不自动下单；债券/黄金/行业 ETF 不适用。
     """
     params = ETF_BAND.get(strategy)
-    if params is None or len(bars) < 250:
+    if params is None:
+        return None
+    if as_of is not None:
+        bars = bars.loc[:as_of]
+    if len(bars) < 250:
         return None
     close = bars["close"].astype(float)
     pre = bars["preclose"].astype(float)
@@ -219,14 +258,15 @@ def _etf_position_band(
     else:
         band, zone = params.low_wait, "低位未止跌"
 
+    where = f"（{pos:.0f}，按 {label} 月末）" if label else f"（{pos:.0f}）"
     if zone in ("高位", "偏高"):
-        action = f"{zone}（{pos:.0f}）：减到 {band:.0%} 仓"
+        action = f"{zone}{where}：减到 {band:.0%} 仓"
     elif zone == "中性":
-        action = f"中性（{pos:.0f}）：保持 {band:.0%} 仓"
+        action = f"中性{where}：保持 {band:.0%} 仓"
     elif zone == "低位止跌":
-        action = f"低位止跌（{pos:.0f}）：加回 {band:.0%} 仓"
+        action = f"低位止跌{where}：加回 {band:.0%} 仓"
     else:
-        action = f"低位未止跌（{pos:.0f}）：保持 {band:.0%} 仓，等止跌"
+        action = f"低位未止跌{where}：保持 {band:.0%} 仓，等止跌"
     return pos, stabilized, band, action
 
 
@@ -314,26 +354,37 @@ def etf_action(
 
 
 def _etf_target_order(
-    target_value: float, value: float, price: float, quantity: int
-) -> tuple[float, float, str]:
-    """把稳健 ETF 的目标缺口翻成整手买卖建议；只建议，不自动下单。
+    target_value: float,
+    value: float,
+    price: float,
+    quantity: int,
+    *,
+    budget: float | None = None,
+) -> tuple[float, float, int, str]:
+    """把稳健 ETF 的目标缺口翻成整手买卖建议；返回（目标、差额、带符号份数、说明）。
 
-    减仓不超过现有份额；差不到一手时不动，避免为了凑目标反复交易。
+    - 减仓不超过现有份额；差不到一手时不动，避免为了凑目标反复交易；
+    - ``budget`` 是本次可用于加仓的现金；不够一手就明说，不能给出买不起的建议。
     """
     gap = target_value - value
     if price <= 0:
-        return target_value, gap, "缺价格，暂不能下单"
+        return target_value, gap, 0, "缺价格，暂不能下单"
     lots = int(abs(gap) // (price * LOT)) * LOT
     if gap > 0:
+        wanted = lots
+        if budget is not None:
+            lots = min(lots, int(max(0.0, budget) // (price * LOT)) * LOT)
         if lots > 0:
-            return target_value, gap, f"加 {lots:,} 份（约 {lots * price:,.0f} 元）"
-        return target_value, gap, "差不足一手，攒够再加"
+            return target_value, gap, lots, f"加 {lots:,} 份（约 {lots * price:,.0f} 元）"
+        if budget is not None and wanted > 0:
+            return target_value, gap, 0, "现金不足一手，等回笼/结余"
+        return target_value, gap, 0, "差不足一手，攒够再加"
     if gap < 0:
         lots = min(lots, quantity)
         if lots > 0:
-            return target_value, gap, f"减 {lots:,} 份（约 {lots * price:,.0f} 元）"
-        return target_value, gap, "超配不足一手，暂不动"
-    return target_value, gap, "已在目标"
+            return target_value, gap, -lots, f"减 {lots:,} 份（约 {lots * price:,.0f} 元）"
+        return target_value, gap, 0, "超配不足一手，暂不动"
+    return target_value, gap, 0, "已在目标"
 
 
 def _half_lot(quantity: int) -> int:
@@ -514,6 +565,34 @@ def base_orders(
     return rows
 
 
+def split_cash(
+    cash: float,
+    *,
+    base_gap: float,
+    steady_gap: float,
+    stock_cap_room: float,
+) -> tuple[float, float, float]:
+    """把可用现金分成（底仓、个股、稳健）三份。
+
+    规则与报告里写的一致：
+    - 稳健 ETF 的买入缺口先留出来（它只有 10%，金额小、目标明确）；
+    - 底仓有缺口时，剩下的现金一半补底仓、一半给个股（HANDOFF：回笼资金一半补底仓）；
+    - 个股不能超过 40% 上限；它买不了的那部分回给底仓，不让现金闲着；
+    - 底仓已达标时，现金全给个股（同样受 40% 上限约束）。
+    """
+    available = max(0.0, cash)
+    steady_budget = min(max(0.0, steady_gap), available)
+    remaining = available - steady_budget
+    if base_gap > 0:
+        base_budget = min(max(0.0, base_gap), remaining * (1.0 - STOCK_CASH_SHARE))
+        stock_budget = min(remaining - base_budget, max(0.0, stock_cap_room))
+        base_budget = min(max(0.0, base_gap), remaining - stock_budget)
+    else:
+        base_budget = 0.0
+        stock_budget = min(remaining, max(0.0, stock_cap_room))
+    return base_budget, stock_budget, steady_budget
+
+
 def build_plan(
     engine: RollingEngine,
     holdings: pd.DataFrame,
@@ -530,11 +609,23 @@ def build_plan(
     stock_share: float = STOCK_SHARE_OF_ASSETS,
     max_new_buys: int = 3,
     cleanup_since: dict[str, str] | None = None,
+    last_rebalance: dict[str, str] | None = None,
     watchlist: Sequence[str] = (),
-    top_up: bool = True,
+    topup: str = "off",
+    top_up: bool | None = None,
 ) -> dict[str, object]:
+    """生成下一交易日的提醒。
+
+    个股的保留/清理/加仓/新买全部交给 :func:`rolling.sleeve_decide`——与回测同一个函数。
+    本函数只负责三件事：准备真实持仓、分配账户现金、把决策翻译成可执行价位。
+    """
     i = len(engine.dates) - 1
     as_of = engine.dates[i]
+    topup_mode = "no_deep_loss" if top_up else topup
+    if topup_mode not in TOPUP_MODES:
+        raise ValueError(f"topup 只能是 {TOPUP_MODES}，收到 {topup!r}")
+    band_date = pd.Timestamp(last_month_end(as_of.date()))
+    band_label = f"{band_date:%m-%d}"
     etf_infos = etf_by_code()
     steady = steady_targets or {}
     stock_capital = total_assets * stock_share
@@ -542,15 +633,29 @@ def build_plan(
     slots = engine.rule_slots(i)
     st_flags = engine.panel.st.to_numpy(dtype=bool)
     listed_days = engine.panel.listed_days.to_numpy(dtype="float64")
+    records = holdings.to_dict("records")
 
-    held = {_bs_code(str(c).zfill(6)) for c in holdings["code"]}
-    # 自选与持仓都参与打分：池内标的本来就在截面里，池外的用成分股截面参数映射进来
+    def code6(value: object) -> str:
+        return str(value).zfill(6)
+
+    value_by_code = {code6(row["code"]): float(row["value"]) for row in records}
+    pnl_by_code = {
+        code6(row["code"]): (
+            float(row["price"]) / float(row["cost"]) - 1.0 if float(row["cost"]) else 0.0
+        )
+        for row in records
+    }
+    qty_by_code = {code6(row["code"]): int(row["quantity"]) for row in records}
+    held = {_bs_code(code) for code in value_by_code}
     tracked = sorted({*held, *(_bs_code(code) for code in watchlist)})
 
+    # ---------- 打分（与回测同一套因子/权重；池外标的用成分股参数映射） ----------
     ranks: dict[str, tuple[str, int, int, float]] = {}
     pool_ranks: dict[str, tuple[str, int, int, float]] = {}
     cut_scores: dict[str, float | None] = {}
+    pool_lines: dict[str, int] = {}
     ranked_by_rule: dict[str, pd.Series] = {}
+    positions_by_rule: dict[str, dict[str, int]] = {}
     expo_by_rule: dict[str, pd.DataFrame] = {}
     weight_by_rule: dict[str, pd.Series] = {}
     for name, rule in engine.rules.items():
@@ -563,14 +668,17 @@ def build_plan(
         expo_by_rule[name] = expo
         weight_by_rule[name] = engine.weights(rule, i).reindex(expo.columns).fillna(0.0)
         ranked_by_rule[name] = ranked
+        positions_by_rule[name] = {
+            code: position for position, code in enumerate(ranked.index, start=1)
+        }
         keep_line = int(math.ceil(slots[name] * rule.buffer))
         for pos, code in enumerate(ranked.index, start=1):
             ranks[code] = (name, pos, keep_line, float(ranked.loc[code]))
-
         # 持仓的保留/清理按**池内**排名（回测口径），自选/池外票不挤占名次；
-        # 池外标的另用“分数 ≥ 池内第 line 名的分数”来判断，等价于引擎的分数规则。
+        # 池外标的另用“分数 ≥ 池内第 line 名的分数”判断，等价于引擎的分数规则。
         pool_ranked = engine.scores(rule, i)
         pool_line = min(keep_line, len(pool_ranked))
+        pool_lines[name] = pool_line
         cut_scores[name] = float(pool_ranked.iloc[pool_line - 1]) if pool_line else None
         for pos, code in enumerate(pool_ranked.index, start=1):
             pool_ranks[code] = (name, pos, pool_line, float(pool_ranked.loc[code]))
@@ -583,7 +691,8 @@ def build_plan(
         row = expo.loc[[code]].iloc[0]
         return _drivers(row, weight_by_rule[group])
 
-    sold_recently = set()
+    # ---------- 成交流水：冷却期与建仓日 ----------
+    sold_recently: set[str] = set()
     entry_days: dict[str, pd.Timestamp] = {}
     if not trades.empty:
         cutoff = engine.dates[max(0, i - COOLDOWN_TRADING_DAYS)].date()
@@ -602,16 +711,154 @@ def build_plan(
             code6=trades["code"].astype(str).str.zfill(6),
             signed=np.where(trades["side"] == "buy", size, -size),
         ).sort_values(["code6", "moment"])
-        for code6, block in work.groupby("code6", sort=False):
+        for code6_value, block in work.groupby("code6", sort=False):
             cumulative = block["signed"].cumsum()
             starts = block[(cumulative > 0) & (cumulative.shift(1, fill_value=0.0) <= 0)]
             if not starts.empty:
-                entry_days[_bs_code(str(code6))] = pd.Timestamp(starts["moment"].iloc[-1])
+                entry_days[_bs_code(str(code6_value))] = pd.Timestamp(starts["moment"].iloc[-1])
+    entry_index: dict[str, int] = {}
+    for bs, day in entry_days.items():
+        index = int(engine.dates.searchsorted(day))
+        if index <= i:
+            entry_index[bs] = index
 
-    views: list[HoldingView] = []
+    # ---------- ETF 仓位带：固定在最近一个月末 ----------
+    band_cache: dict[str, tuple[float, float | None, str, str]] = {}
+
+    def band_of(bs: str) -> tuple[float, float | None, str, str]:
+        """（系数、250 日位置、动作说明、策略族）；没有数据时系数按 1.0。"""
+        if bs in band_cache:
+            return band_cache[bs]
+        info = etf_infos.get(bs)
+        strategy = strategy_of(info) if info is not None else ""
+        data = _etf_position_band(
+            etf_bars.get(bs, pd.DataFrame()), strategy, as_of=band_date, label=band_label
+        )
+        if data is None:
+            result: tuple[float, float | None, str, str] = (1.0, None, "", strategy)
+        else:
+            position, _stabilized, band, action = data
+            result = (band, position, action, strategy)
+        band_cache[bs] = result
+        return result
+
+    # ---------- 账户现金：先留稳健买入，再按“底仓一半 / 个股一半”分 ----------
+    stock_value = sum(
+        value for code, value in value_by_code.items() if _bs_code(code) not in etf_names
+    )
+    stock_cap_room = max(0.0, stock_capital - stock_value)
+    base_gap_total = sum(
+        max(
+            0.0,
+            total_assets * BASE_SHARE_OF_ASSETS * weight * band_of(_bs_code(code))[0]
+            - value_by_code.get(code, 0.0),
+        )
+        for code, weight in base_targets.items()
+    )
+    steady_gap_total = sum(
+        max(
+            0.0,
+            total_assets * weight * band_of(_bs_code(code))[0] - value_by_code.get(code, 0.0),
+        )
+        for code, weight in steady.items()
+        if code in value_by_code
+    )
+    base_budget, stock_budget, steady_budget = split_cash(
+        cash,
+        base_gap=base_gap_total,
+        steady_gap=steady_gap_total,
+        stock_cap_room=stock_cap_room,
+    )
+
+    # 稳健 ETF：先占预算，按 universe 顺序；卖出不占预算
+    steady_orders: dict[str, tuple[float, float, int, str]] = {}
+    steady_left = steady_budget
+    for code, weight in steady.items():
+        if code not in value_by_code:
+            # 目标配了但没持有：暂不建仓，也不占现金预算（避免钱被“看不见的 ETF”锁住）
+            continue
+        bs = _bs_code(code)
+        target = total_assets * weight * band_of(bs)[0]
+        price = _etf_last_close(etf_bars.get(bs, pd.DataFrame())) or 0.0
+        target_value, gap, lots, text = _etf_target_order(
+            target, value_by_code.get(code, 0.0), price, qty_by_code.get(code, 0),
+            budget=steady_left,
+        )
+        if lots > 0:
+            steady_left -= lots * price
+        steady_orders[code] = (target_value, gap, lots, text)
+
+    # ---------- 个股：与回测共用 sleeve_decide ----------
+    previous_rebalance = dict(last_rebalance or {})
+    rebalance_state = dict(previous_rebalance)
+    due_by_rule: dict[str, bool] = {}
+    decisions: dict[str, SleeveDecision] = {}
+    sells: set[str] = set()
+    keeps: set[str] = set()
     kept_by_rule: dict[str, int] = {}
-    for row in holdings.to_dict("records"):
-        code = str(row["code"]).zfill(6)
+    topup_candidates: dict[str, int] = {}
+    room = stock_budget
+    for name, rule in engine.rules.items():
+        ranked = ranked_by_rule[name]
+        held_items = [
+            SleeveHolding(
+                code=_bs_code(code),
+                entry_day=entry_index.get(_bs_code(code)),
+                score=(
+                    ranks[_bs_code(code)][3] if _bs_code(code) in ranks else None
+                ),
+                value=value,
+                ret=pnl_by_code.get(code, 0.0),
+            )
+            for code, value in value_by_code.items()
+            if _bs_code(code) not in etf_names
+            and ranks.get(_bs_code(code), ("",))[0] == name
+        ]
+        last = previous_rebalance.get(name)
+        if last:
+            last_index = min(int(engine.dates.searchsorted(pd.Timestamp(last))), i)
+            due = i - last_index >= rule.period
+        else:
+            due = True
+        if due:
+            rebalance_state[name] = as_of.date().isoformat()
+        due_by_rule[name] = due
+        decision = sleeve_decide(
+            rule, ranked, held_items,
+            slots=slots.get(name, 0), slot_value=slot_value, day=i, due=due, room=room,
+            max_price=slot_value / LOT,
+            price_of=lambda code: float(engine.close[i, engine.col[code]]),
+            cooldown_until={code: i for code in sold_recently},
+            switch_tolerance=engine.switch_tolerance,
+            topup=topup_mode,
+            topup_priority=False,
+            cut=cut_scores.get(name),
+            line=pool_lines.get(name, 0),
+            tradable=lambda code: bool(
+                engine.trading[i, engine.col[code]]
+                and not st_flags[i, engine.col[code]]
+                and listed_days[i, engine.col[code]] >= 120
+            ),
+        )
+        room = decision.room
+        decisions[name] = decision
+        sells.update(decision.sells)
+        keeps.update(decision.keep)
+        kept_by_rule[name] = len(decision.keep)
+        for code, _gap in decision.topups:
+            topup_candidates[code] = _top_up_shares(
+                value_by_code.get(code[3:], 0.0),
+                slot_value,
+                float(engine.close[i, engine.col[code]]),
+            )
+    cleanup_since_bs = {
+        _bs_code(str(code).zfill(6)): start for code, start in (cleanup_since or {}).items()
+    }
+
+    # ---------- 持仓视图 ----------
+    views: list[HoldingView] = []
+    for row in records:
+        code = code6(row["code"])
         bs = _bs_code(code)
         name_ = str(row["name"])
         price, cost, qty = float(row["price"]), float(row["cost"]), int(row["quantity"])
@@ -622,7 +869,7 @@ def build_plan(
             ma10, ma20, ma60 = _etf_mas(bars)
             etf_info = etf_infos.get(bs)
             asset_class = etf_info.asset_class if etf_info is not None else ""
-            strategy = strategy_of(etf_info) if etf_info is not None else ""
+            band, etf_position, band_action, strategy = band_of(bs)
             role = (etf_roles or {}).get(bs, "波段")
             action, detail = etf_action(role, code, price, ma10, ma20, base_targets)
             strength = _etf_trend_strength(bars) if role == "波段" else None
@@ -631,31 +878,32 @@ def build_plan(
                     f"趋势强度 {strength:.0f}/100（{price / ma20 - 1.0:+.1%} vs MA20）；"
                     + detail
                 )
-            etf_position = etf_band = None
-            band_action = ""
-            band_data = _etf_position_band(bars, strategy)
-            if band_data is not None:
-                etf_position, _stabilized, etf_band, band_action = band_data
             etf_target_value = etf_gap = None
+            etf_lots = 0
             etf_order = ""
             if code in steady:
-                band = 1.0 if etf_band is None else etf_band
-                target_value = total_assets * steady[code] * band
-                etf_target_value, etf_gap, etf_order = _etf_target_order(
-                    target_value, value, price, qty
-                )
+                etf_target_value, etf_gap, etf_lots, etf_order = steady_orders[code]
                 detail = (
                     f"目标 {etf_target_value:,.0f} 元（{steady[code]:.0%} × 系数 {band:.0%}）、"
                     f"现 {value:,.0f} 元；{etf_order}。" + detail
                 )
+                if etf_lots < 0 and "不低位卖出" in detail:
+                    detail = detail.replace(
+                        "；在 MA20 下方，不低位卖出",
+                        "；减仓来自月末仓位带的目标差额，不是跌破 MA20 的波段卖出",
+                    )
             group = "底仓" if code in base_targets else f"ETF·{role}"
-            views.append(HoldingView(code, name_, "ETF", qty, price, cost, value,
-                                     pnl, group, None, None, ma10, ma20, ma60, action, detail,
-                                     strength=strength, asset_class=asset_class,
-                                     strategy=strategy, etf_position=etf_position,
-                                     etf_band=etf_band, etf_band_action=band_action,
-                                     etf_target_value=etf_target_value, etf_gap=etf_gap,
-                                     etf_order=etf_order))
+            views.append(
+                HoldingView(
+                    code, name_, "ETF", qty, price, cost, value, pnl, group,
+                    None, None, ma10, ma20, ma60, action, detail,
+                    strength=strength, asset_class=asset_class, strategy=strategy,
+                    etf_position=etf_position,
+                    etf_band=band if band_action else None,
+                    etf_band_action=band_action, etf_target_value=etf_target_value,
+                    etf_gap=etf_gap, etf_order=etf_order, etf_lots=etf_lots,
+                )
+            )
             continue
         j = engine.col.get(bs)
         ma10 = ma20 = ma60 = None
@@ -680,11 +928,14 @@ def build_plan(
                 held_days = i - entry
         min_hold = engine.rules[group].min_hold if group in engine.rules else 0
         within_min_hold = held_days is not None and held_days < min_hold
-        keep_by_score = score is not None and cut is not None and score >= cut
-
-        add_shares = 0
-        if within_min_hold or keep_by_score:
-            kept_by_rule[group] = kept_by_rule.get(group, 0) + 1
+        is_due = due_by_rule.get(group, True)
+        # 调仓日以本次决策为准；非调仓日沿用已有清理，直到成交或下次重排
+        persisted = bs in cleanup_since_bs and not (is_due and bs in keeps)
+        is_cleanup = bs in sells or persisted
+        add_shares = topup_candidates.get(bs, 0) if bs in keeps else 0
+        if group not in engine.rules or merged is None:
+            action, detail = "保留", "今日无法评分（停牌/无行情/行业未映射），暂不处理"
+        elif not is_cleanup:
             if pool is not None:
                 action, detail = "保留", f"{group} 第 {rank} 名（保留线 {zone}）"
             elif score is not None and cut is not None:
@@ -693,37 +944,48 @@ def build_plan(
                     f"池外标的（不占池内名次），组内分 {score:+.2f} ≥ 保留门槛 {cut:+.2f}",
                 )
             else:
-                action, detail = "保留", f"{group}；建仓未满最短持有，先持有"
+                action, detail = "保留", f"{group}；无法评分，先持有"
             if within_min_hold:
                 detail += (
                     f"；建仓才 {held_days} 个交易日（最短持有 {min_hold} 日），按规则先持有"
                 )
-            # 加仓只给“组名额以内”的持仓；深套票不补，避免回到“补仓摊低”的老路
-            if (
-                top_up
-                and pnl > DEEP_LOSS
-                and rank is not None
-                and rank <= slots.get(group, 0)
-            ):
-                add_shares = _top_up_shares(value, slot_value, price)
+            if not is_due:
+                last = previous_rebalance.get(group)
+                detail += (
+                    f"；未到调仓日（{group} {engine.rules[group].period} 日一调"
+                    + (f"，上次 {last}" if last else "")
+                    + "），本次不重排"
+                )
         else:
             action, detail = _cleanup(price, ma10, ma20)
             if pool is not None:
-                detail = f"{group} 第 {rank} 名，跌出保留线 {zone}；" + detail
+                if is_due and bs in sells:
+                    prefix = f"{group} 第 {rank} 名，本次调仓日跌出保留线 {zone}；"
+                else:
+                    prefix = (
+                        f"{group} 第 {rank} 名；已于 {cleanup_since_bs.get(bs, '')} 进入清理，"
+                        "继续挂条件单；"
+                    )
+                detail = prefix + detail
             elif merged is not None and score is not None and cut is not None:
-                detail = (
-                    f"池外标的（不占池内名次），组内分 {score:+.2f} < 保留门槛 "
-                    f"{cut:+.2f}；" + detail
-                )
-            elif j is None:
-                detail = "不在当前沪深300/中证500 股票池（无行情）；" + detail
+                if is_due and bs in sells:
+                    detail = (
+                        f"池外标的（不占池内名次），组内分 {score:+.2f} < 保留门槛 "
+                        f"{cut:+.2f}；" + detail
+                    )
+                else:
+                    detail = (
+                        "池外标的（不占池内名次）；已于 "
+                        f"{cleanup_since_bs.get(bs, '')} 进入清理，继续挂条件单；" + detail
+                    )
             else:
                 detail = "今日无法评分（停牌/ST/因子不足）；" + detail
-        views.append(HoldingView(code, name_, "股票", qty, price, cost, value,
-                                 pnl, group, rank, zone, ma10, ma20, ma60, action, detail,
-                                 score, add_shares, drivers_of(bs), _strength(score, cut)))
+        views.append(
+            HoldingView(code, name_, "股票", qty, price, cost, value, pnl, group,
+                        rank, zone, ma10, ma20, ma60, action, detail,
+                        score, add_shares, drivers_of(bs), _strength(score, cut))
+        )
 
-    watch_set = {_bs_code(code) for code in watchlist}
     views, cleanup_state = apply_patience(
         views, pd.DatetimeIndex(engine.dates[: i + 1]), cleanup_since or {}
     )
@@ -733,42 +995,35 @@ def build_plan(
         and not etf_bars.get(_bs_code(v.code), pd.DataFrame()).empty
         and etf_bars[_bs_code(v.code)].index.max() < as_of
     )
+
+    # ---------- 新买：顺序就是 sleeve_decide 给钱的顺序（板块组顺序，组内排名） ----------
+    watch_set = {_bs_code(code) for code in watchlist}
     ideas: list[BuyIdea] = []
     buy_cut: dict[str, float] = {}
-    for name, ranked in ranked_by_rule.items():
-        room = max(0, slots[name] - kept_by_rule.get(name, 0))
+    for name, decision in decisions.items():
+        ranked = ranked_by_rule[name]
         last_pos = 0
-        for pos, code in enumerate(ranked.index, start=1):
-            if room <= 0:
-                break
-            if code in held or code in sold_recently:
-                continue
+        for code in decision.buys:
+            position = positions_by_rule[name][code]
             j = engine.col[code]
-            # 池外自选可以买，但必须至少有“非 ST、上市满 120 日、今天在交易”的资格；
-            # 池内标的本来就过了 eligible，这一层对所有候选都成立。
-            if not engine.trading[i, j] or st_flags[i, j] or listed_days[i, j] < 120:
-                continue
             close = float(engine.close[i, j])
             limit = round(close * (1.0 + BUY_LIMIT_MARKUP), 2)
             shares = int(slot_value // (limit * LOT)) * LOT
             if shares <= 0:
                 continue
             ideas.append(
-                BuyIdea(code[3:], names.get(code[3:], code[3:]), name, pos, close, limit,
+                BuyIdea(code[3:], names.get(code[3:], code[3:]), name, position, close, limit,
                         shares, shares * limit, score=float(ranked.loc[code]),
                         origin="自选" if code in watch_set else "池内",
                         drivers=drivers_of(code))
             )
-            last_pos = pos
-            room -= 1
+            last_pos = position
         if last_pos:
             # 买入线 = 同组第一个没买到的标的；没有下一只时退回最后一只
             line = last_pos if last_pos < len(ranked) else last_pos - 1
             buy_cut[name] = float(ranked.iloc[line])
-    ideas.sort(key=lambda b: (b.rank, b.group))
-    # 现金能覆盖的前 max_new_buys 只标“买入”，其余是“候补”；标记在这里做，
-    # 报告与结构化落盘共用同一份结果，避免两处各算一遍。
-    budget = cash
+
+    budget = stock_budget
     shown = 0
     tagged: list[BuyIdea] = []
     for idea in ideas:
@@ -782,20 +1037,9 @@ def build_plan(
             )
         )
     ideas = tagged
-
-    idx = group_indices(engine)
-    trend = []
-    for name in engine.rules:
-        series = idx[name].iloc[: i + 1]
-        ma120 = float(series.rolling(120).mean().iloc[-1])
-        last = float(series.iloc[-1])
-        trend.append((name, last / ma120 - 1.0, slots[name]))
-
     spent_on_stocks = sum(b.amount for b in ideas if b.tag == "买入")
 
-    # 加仓排在最后：回测（12 起点）显示现金先给新买入优于先给加仓——
-    # 加仓优先年化 8.3% vs 8.5%、超额 +2.3% vs +2.5%，回撤没换来好处。
-    # 所以只用“新买之后剩下的钱”补仓；排不上就退回“保留”，不硬凑。
+    # 加仓只用新买之后剩下的钱；排不上就退回“保留”，不硬凑
     funded: dict[str, int] = {}
     for candidate in sorted((v for v in views if v.add_shares > 0),
                             key=lambda v: (v.rank or 0, v.code)):
@@ -803,7 +1047,7 @@ def build_plan(
         if need <= budget:
             funded[candidate.code] = candidate.add_shares
             budget -= need
-    spent_on_topup = cash - spent_on_stocks - budget
+    spent_on_topup = max(0.0, stock_budget - spent_on_stocks - budget)
     views = [
         dataclasses.replace(
             v,
@@ -813,7 +1057,11 @@ def build_plan(
                 f"{v.detail}；目标仓位 {slot_value:,.0f} 元、现 {v.value:,.0f} 元，"
                 f"补 {funded[v.code]} 股（约 {funded[v.code] * v.price:,.0f} 元）"
                 if v.code in funded
-                else v.detail
+                else (
+                    f"{v.detail}；目标仓位还差 {v.add_shares} 股，现金不足，本次不补"
+                    if v.add_shares > 0
+                    else v.detail
+                )
             ),
         )
         for v in views
@@ -835,13 +1083,13 @@ def build_plan(
                                          "", "今日不可评分（停牌/ST/因子不足）"))
             continue
         group, pos, keep, score = info
-        room = max(0, slots[group] - kept_by_rule.get(group, 0))
+        room_left = max(0, slots[group] - kept_by_rule.get(group, 0))
         if bs in sold_recently:
             status = "冷却期不回补"
         elif not engine.trading[i, j] or st_flags[i, j] or listed_days[i, j] < 120:
             status = "不可买（ST/新股/停牌）"
-        elif pos <= room:
-            status = "可买"
+        elif pos <= room_left:
+            status = "可买" if stock_budget > 0 else "可买（等现金）"
         elif pos <= keep:
             status = "持有才留"
         else:
@@ -849,6 +1097,14 @@ def build_plan(
         watch_views.append(WatchView(code, names.get(code, code), group, pos, keep, score,
                                      drivers_of(bs), status,
                                      _strength(score, cut_scores.get(group))))
+
+    idx = group_indices(engine)
+    trend = []
+    for name in engine.rules:
+        series = idx[name].iloc[: i + 1]
+        ma120 = float(series.rolling(120).mean().iloc[-1])
+        last_value = float(series.iloc[-1])
+        trend.append((name, last_value / ma120 - 1.0, slots[name]))
 
     return {
         "as_of": as_of.date(),
@@ -869,18 +1125,27 @@ def build_plan(
         "slot_value": slot_value,
         "stock_capital": stock_capital,
         "stock_share": stock_share,
+        "stock_value": stock_value,
+        "stock_cap_room": stock_cap_room,
         "steady_targets": dict(steady),
         "cash": cash,
+        "topup": topup_mode,
         "spent_on_topup": spent_on_topup,
         "total_assets": total_assets,
+        "stock_budget": stock_budget,
+        "base_budget": base_budget,
+        "steady_budget": steady_budget,
         "sold_recently": sorted(c[3:] for c in sold_recently),
         "cleanup_state": cleanup_state,
+        "rebalance_state": rebalance_state,
+        "due_by_rule": due_by_rule,
+        "steady_orders": steady_orders,
         "base_orders": base_orders(
             base_targets,
             total_assets=total_assets,
             views=views,
             etf_bars=etf_bars,
-            cash_now=cash - spent_on_topup - spent_on_stocks,
+            cash_now=base_budget,
             band_multipliers={
                 v.code: v.etf_band
                 for v in views
@@ -948,6 +1213,7 @@ def plan_payload(
             ),
             "etf_gap": None if v.etf_gap is None else round(v.etf_gap, 2),
             "etf_order": v.etf_order,
+            "etf_lots": v.etf_lots,
             "add_shares": v.add_shares,
             "drivers": v.drivers,
         }
@@ -985,6 +1251,34 @@ def plan_payload(
         }
         for w in cast("list[WatchView]", plan.get("watch") or [])
     ]
+    base_rows: list[dict[str, object]] = [
+        {
+            "code": entry.code,
+            "weight": entry.weight,
+            "band": entry.band,
+            "target": round(entry.target, 2),
+            "have": round(entry.have, 2),
+            "gap": round(entry.gap, 2),
+            "limit": None if entry.limit is None else round(entry.limit, 3),
+            "shares": entry.shares_now,
+            "amount": round(entry.amount_now, 2),
+            "shares_to_target": entry.shares_to_target,
+        }
+        for entry in cast("list[BaseOrder]", plan.get("base_orders") or [])
+    ]
+    steady_orders = cast(
+        "dict[str, tuple[float, float, int, str]]", plan.get("steady_orders") or {}
+    )
+    steady_rows: list[dict[str, object]] = [
+        {
+            "code": code,
+            "target": round(target, 2),
+            "gap": round(gap, 2),
+            "lots": lots,
+            "order": text,
+        }
+        for code, (target, gap, lots, text) in steady_orders.items()
+    ]
     return {
         "schema": 1,
         "as_of": as_of.isoformat(),
@@ -993,6 +1287,11 @@ def plan_payload(
         "rules": {
             "fingerprint": rules_fingerprint,
             "max_new_buys": max_new_buys,
+            "topup": str(plan.get("topup", "off")),
+        },
+        "rebalance": {
+            "last": cast("dict[str, str]", plan.get("rebalance_state") or {}),
+            "due": cast("dict[str, bool]", plan.get("due_by_rule") or {}),
         },
         "slots": {
             name: int(count)
@@ -1007,6 +1306,11 @@ def plan_payload(
             "total_assets": round(float(plan["total_assets"]), 2),  # type: ignore[arg-type]
             "cash": round(float(plan["cash"]), 2),  # type: ignore[arg-type]
             "stock_capital": round(float(plan["stock_capital"]), 2),  # type: ignore[arg-type]
+            "stock_value": round(float(plan.get("stock_value", 0.0)), 2),  # type: ignore[arg-type]
+            "stock_cap_room": round(float(plan.get("stock_cap_room", 0.0)), 2),  # type: ignore[arg-type]
+            "stock_budget": round(float(plan.get("stock_budget", 0.0)), 2),  # type: ignore[arg-type]
+            "base_budget": round(float(plan.get("base_budget", 0.0)), 2),  # type: ignore[arg-type]
+            "steady_budget": round(float(plan.get("steady_budget", 0.0)), 2),  # type: ignore[arg-type]
             "slot_value": round(float(plan["slot_value"]), 2),  # type: ignore[arg-type]
             "allocation": {
                 "base": BASE_SHARE_OF_ASSETS,
@@ -1022,6 +1326,8 @@ def plan_payload(
         "holdings": holdings,
         "buys": buys,
         "watch": watch,
+        "base_orders": base_rows,
+        "steady_orders": steady_rows,
     }
 
 
@@ -1048,6 +1354,13 @@ def render_plan(
     steady_targets = cast("dict[str, float]", plan.get("steady_targets") or {})
     steady_share = sum(steady_targets.values())
     raw_orders = cast("list[BaseOrder]", plan.get("base_orders") or [])
+    stock_value_total = float(plan.get("stock_value", 0.0))  # type: ignore[arg-type]
+    stock_budget = float(plan.get("stock_budget", 0.0))  # type: ignore[arg-type]
+    base_budget = float(plan.get("base_budget", 0.0))  # type: ignore[arg-type]
+    steady_budget = float(plan.get("steady_budget", 0.0))  # type: ignore[arg-type]
+    due_by_rule = cast("dict[str, bool]", plan.get("due_by_rule") or {})
+    rebalance_state = cast("dict[str, str]", plan.get("rebalance_state") or {})
+    slots_total = sum(cast("dict[str, int]", plan["slots"]).values())
     base_target_value = sum(entry.target for entry in raw_orders)
     if not raw_orders:
         base_target_value = total * BASE_SHARE_OF_ASSETS
@@ -1077,6 +1390,43 @@ def render_plan(
     )
 
     target_day = f"{next_day}（下一交易日）" if next_day else "下一交易日"
+    if stock_budget > 0:
+        buy_bullet = (
+            f"- {target_day}最多新买 **{max_new_buys} 只**策略标的；"
+            f"个股 sleeve 本次可用 {stock_budget:,.0f} 元"
+            f"（可用现金 {cash:,.0f} 元里，{base_budget:,.0f} 元留给底仓、"
+            f"{steady_budget:,.0f} 元留给稳健 ETF），"
+            f"实际只够 **{actual_buys} 只**"
+            + (
+                ""
+                if actual_buys >= max_new_buys
+                else f"（还差 {max_new_buys - actual_buys} 只的钱）"
+            )
+            + "；清理回笼的钱由之后每天的报告继续安排。"
+        )
+    else:
+        buy_bullet = (
+            f"- **个股已超配**：现 {stock_value_total / total:.0%}、上限 {stock_share:.0%}；"
+            "本次不新买，现金先补底仓。"
+        )
+    topup_mode = str(plan.get("topup", "off"))
+    if topup_mode == "off":
+        topup_bullet = (
+            "- 加仓默认关闭（与 8.5% 回测基线一致）；需要时用 `--topup no-deep-loss` 开启。"
+        )
+    elif topups:
+        topup_bullet = (
+            f"- 其中 **{len(topups)} 个仍在保留线内但低于目标仓位**，补到目标需 "
+            f"{topup_value:,.0f} 元；这笔钱排在新买之后，剩下多少补多少。"
+        )
+    else:
+        topup_bullet = "- 没有“仍在保留线内、但低于目标仓位”的持仓，本次不需要加仓。"
+    if base_value + steady_value >= base_target_value + steady_target_value:
+        structure_note = "，底仓/稳健已达标，现金留给策略名额"
+    elif stock_budget > 0:
+        structure_note = "，现金按“一半补底仓、一半重建个股”分配"
+    else:
+        structure_note = "，个股超配，现金优先补底仓"
     lines = [
         f"# 操作提醒：{target_day}，数据截至 {as_of} 收盘",
         "",
@@ -1088,32 +1438,15 @@ def render_plan(
         f"- 现有 {len(views)} 个持仓：**{len(keep)} 个保留/持有**，"
         f"**{len(clean)} 个进入存量清理**（市值约 {clean_value:,.0f} 元），**不在低点一次性割**，"
         "挂反弹条件单分批卖。",
-        (
-            f"- 其中 **{len(topups)} 个仍在保留线内但低于目标仓位**，补到目标需 "
-            f"{topup_value:,.0f} 元；这笔钱排在新买之后（回测显示先买新票更划算），"
-            "剩下多少补多少。"
-            if topups
-            else "- 没有“仍在保留线内、但低于目标仓位”的持仓，本次不需要加仓"
-            "（加仓只给还在保留线内的票，不给跌出线的票补仓摊低）。"
-        ),
-        f"- {target_day}最多新买 **{max_new_buys} 只**策略标的；按当前可用现金 "
-        f"{cash:,.0f} 元，实际只够 **{actual_buys} 只**"
-        + (
-            ""
-            if actual_buys >= max_new_buys
-            else f"（还差 {max_new_buys - actual_buys} 只的钱）"
-        )
-        + "；清理回笼的钱由之后每天的报告继续安排。",
+        topup_bullet,
+        buy_bullet,
         f"- 目标结构：底仓 {BASE_SHARE_OF_ASSETS:.0%} 上限"
-        f"（按仓位带后 {base_target_value / total:.0%}）"
+        f"（按月末仓位带后 {base_target_value / total:.0%}）"
         f" + 稳健 ETF {steady_share:.0%} 上限（按仓位带后 {steady_target_value / total:.0%}）"
         f" + 个股 {stock_share:.0%}；"
-        f"底仓现 {base_value / total:.0%}、稳健现 {steady_value / total:.0%}"
-        + (
-            "，清理回笼资金按差额优先补底仓/稳健"
-            if base_value + steady_value < base_target_value + steady_target_value
-            else "，已达标，回笼资金留给策略名额"
-        )
+        f"底仓现 {base_value / total:.0%}、稳健现 {steady_value / total:.0%}、"
+        f"个股现 {stock_value_total / total:.0%}"
+        + structure_note
         + "；波段类 ETF 规则待验证，暂不新增。",
         "",
         f"## 二、账户现状（对账单 {period_end:%m-%d}）",
@@ -1135,12 +1468,17 @@ def render_plan(
         "",
         f"- {market_line}",
         "",
-        "| 板块组 | 板块指数相对 MA120 | 当前名额 |",
-        "|---|---|---|",
+        "| 板块组 | 板块指数相对 MA120 | 当前名额 | 本次调仓 |",
+        "|---|---|---|---|",
     ]
     for name, gap, n in trend:
         state = "趋势向上（加配 ×1.3）" if gap > 0 else "趋势向下（减配 ×0.7）"
-        lines.append(f"| {name} | {gap:+.1%} {state} | {n} |")
+        if due_by_rule.get(name, True):
+            when = "**重排**"
+        else:
+            last = rebalance_state.get(name, "")
+            when = f"不重排（上次 {last}）" if last else "不重排"
+        lines.append(f"| {name} | {gap:+.1%} {state} | {n} | {when} |")
     lines += [
         "",
         "每个篮子的因子和权重都不一样——防御看低波/便宜/高 ROE，科技成长只看反转和价量，"
@@ -1189,7 +1527,7 @@ def render_plan(
             "",
             "## 四之二、ETF 仓位带（只建议，不自动下单）",
             "",
-            "| 代码 | 名称 | 资产类别 | 角色 | 现价 | 250日位置 | 策略 | 建议系数 | "
+            "| 代码 | 名称 | 资产类别 | 角色 | 现价 | 250日位置（月末） | 策略 | 建议系数 | "
             "目标金额 | 现市值 | 差额 | 建议 |",
             "|---|---|---|---|---|---|---|---|---|---|---|",
         ]
@@ -1213,7 +1551,8 @@ def render_plan(
             "底仓 50% 是上限，每只再乘自己的系数，所以实际目标通常低于 50%。",
             "目标金额 = 总资产 × 该 ETF 的配置目标 × 建议系数；只有 universe.yaml 里配了 "
             "steady_etf 目标的才给金额和整手买卖建议，其他 ETF 只看系数。"
-            "低位止跌 = 收盘≥MA20 或 5 日收益>0，是确认不是预测；"
+            "系数按最近一个月末的 250 日位置计算，月内不变（研究口径就是月末调仓）；"
+            "低位止跌 = 月末收盘≥MA20 或 5 日收益>0，是确认不是预测；"
             "黄金/债券只做再平衡、行业/主题仍按清理规则，都不用这张表。",
         ]
     lines += [
@@ -1227,7 +1566,8 @@ def render_plan(
         "底仓/稳健 ETF 不打分，改看四之二的仓位带。它不是上涨概率，也不能当绝对买卖阈值；"
         "波段 ETF 的强度只作清理参考，买卖仍按暂行 MA20 规则，规则回测通过前不用于新买。",
         "",
-        f"清理规则：条件单价位每天按最新均线更新；"
+        f"清理规则：只在调仓日（防御 60 日、其余 20 日）新增清理；已进入清理的继续挂条件单，"
+        f"直到成交或下次调仓日重新评估。条件单价位每天按最新均线更新；"
         f"进入清理满 {CLEANUP_PATIENCE} 个交易日仍未反弹到位的，"
         "报告会改为“收盘前卖一半”（起始日记在 portfolio/plan_state.json）。"
         + (
@@ -1237,12 +1577,14 @@ def render_plan(
         ),
         "",
         f"清理完成后：如果 {len(clean)} 只清理仓全部按条件单成交，回笼约 {clean_value:,.0f} 元——"
-        f"其中 {clean_value * BASE_REBALANCE_SHARE:,.0f} 元按差额补底仓/稳健，"
-        f"剩下 {clean_value * (1 - BASE_REBALANCE_SHARE):,.0f} 元按排名重建个股；"
-        f"个股持仓会从 {len(stock_now)} 只降到 {len(stock_after)} 只"
-        "（这个数字是“全部成交”的上限，实际会分很多天）。",
+        f"按规则约 {clean_value * BASE_REBALANCE_SHARE:,.0f} 元补底仓/稳健、"
+        f"{clean_value * (1 - BASE_REBALANCE_SHARE):,.0f} 元按排名重建个股；"
+        f"个股会先剩 {len(stock_after)} 只，加上今天新买 {actual_buys} 只是 "
+        f"{len(stock_after) + actual_buys} 只，之后按排名补到 {slots_total} 个名额"
+        "（这是“全部成交 + 新买都成交”的上限，实际会分很多天）。",
         "",
-        f"## 五、新买入（{target_day}，最多 {max_new_buys} 只，按排名先后，限价不追高）",
+        f"## 五、新买入候选（{target_day}，最多 {max_new_buys} 只，"
+        "按板块组顺序、组内按排名——与回测的给钱顺序一致）",
         "",
         f"| 优先级 | 代码 | 名称 | 来源 | 板块组/排名 | 组内分 | 强度 | 驱动 | "
         f"{as_of:%m-%d} 收盘 | 限价（≤） | 股数 | 约金额 |",
@@ -1256,9 +1598,10 @@ def render_plan(
         )
     lines += [
         "",
-        "- “买入”= 现金够用且在当日上限内，开盘后挂限价单；"
+        "- “买入”= 个股 sleeve 现金够用且在当日上限内，开盘后挂限价单；"
         "当天没成交就撤单，收盘后按新报告重排。",
-        "- “候补”= 等清理回笼资金后按顺序补；每天最多新买 3 只，避免一次性大换仓。",
+        "- “候补”= 等清理回笼资金后按顺序补；每天最多新买 3 只，避免一次性大换仓。"
+        "个股总市值超过目标比例时，不出新买，现金先补底仓。",
         "- “来源”= 池内（沪深300/中证500 成分）或 自选（universe.yaml 的个人自选池）。"
         "自选票与成分股用同一套因子、同一个组内分布打分，没有单独放宽。",
         f"- 近 {COOLDOWN_TRADING_DAYS} 个交易日卖出过的不回补："
@@ -1288,7 +1631,7 @@ def render_plan(
         "状态只看分数与可交易性，不看持有成本，也不看个人偏好。已持仓的自选票不在这里重复，"
         "见第四节持仓表。",
         "",
-        f"## 七、底仓再平衡（目标：总资产 {BASE_SHARE_OF_ASSETS:.0%} 上限 × 仓位带）",
+        f"## 七、底仓再平衡（目标：总资产 {BASE_SHARE_OF_ASSETS:.0%} 上限 × 月末仓位带）",
         "",
         "| 代码 | 目标占底仓 | 仓位带 | 目标金额 | 现有市值 | 差额 | 限价（≤） | "
         "本次可买 | 每回笼 1 万元 | 补到目标还需 |",
@@ -1348,7 +1691,9 @@ def render_plan(
                 )
     lines += ["", *rebalance_notes]
     lines += [
-        "- “本次可买”用的是个股新买之后剩下的现金；为 0 说明现金已被当日新买占满。",
+        "- “本次可买”用的是分配给底仓的现金（通常是一半；个股超配时个股那份也回给底仓）；"
+        "为 0 说明这次没轮到它。",
+        "- 仓位带按最近一个月末计算，月内不变；不会因为盘中/单日涨跌反复改目标。",
         "- 限价 = 最新收盘 × 1.02，100 份为一手；当天没成交就撤单，第二天按新报告重算。",
         "",
         "## 八、你的交易记录体检（对账单 "

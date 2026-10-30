@@ -33,6 +33,8 @@ from tradecompass.research.etfs import etf_by_code
 HORIZONS: tuple[int, ...] = (1, 5, 20)
 EXECUTION_WINDOW = 5
 BENCHMARK_KEY = "hs300"
+ETF_PREFIXES = frozenset({"15", "16", "18", "51", "52", "56", "58"})
+"""ETF 代码前缀；静态名单 ``etf_by_code`` 之外的 ETF（如用户持仓的行业 ETF）也能读对行情。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,18 +49,32 @@ class AdviceOutcome:
     excess: dict[int, float | None]
     touched: bool | None
     executed: bool | None
+    category: str = "stock"
+    """stock / base / steady；底仓与稳健 ETF 订单单独统计。"""
+    fingerprint: str = ""
+    """建议所属的规则指纹；冻结后指纹变化意味着样本外失效。"""
 
 
-def load_history(directory: Path) -> list[dict[str, Any]]:
-    """读取全部已落盘的提醒，按建议日排序；坏文件跳过而不是中断。"""
+def load_history(directory: Path, *, since: date | None = None) -> list[dict[str, Any]]:
+    """读取全部已落盘的提醒，按建议日排序；坏文件跳过而不是中断。
+
+    ``since`` 用于真样本外：只保留建议日在该日及以后的提醒。
+    """
     plans: list[dict[str, Any]] = []
     for path in sorted(directory.glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(payload, dict) and payload.get("schema") == 1:
-            plans.append(payload)
+        if not (isinstance(payload, dict) and payload.get("schema") == 1):
+            continue
+        try:
+            target = date.fromisoformat(str(payload.get("target_day")))
+        except ValueError:
+            continue
+        if since is not None and target < since:
+            continue
+        plans.append(payload)
     plans.sort(key=lambda item: str(item.get("target_day", "")))
     return plans
 
@@ -123,9 +139,14 @@ def _executed(
 
 def _bars(paths: Paths, code: str) -> pd.DataFrame:
     bs = rdata.to_bs_code(code)
-    if bs in etf_by_code():
+    if bs in etf_by_code() or bs.split(".")[-1][:2] in ETF_PREFIXES:
         return rdata.read_etf_bars(paths, bs)
     return rdata.read_stock_bars(paths, bs)
+
+
+def _is_etf(code: str) -> bool:
+    bs = rdata.to_bs_code(code)
+    return bs in etf_by_code() or bs.split(".")[-1][:2] in ETF_PREFIXES
 
 
 def evaluate_plan(
@@ -154,59 +175,88 @@ def evaluate_plan(
     )
 
     outcomes: list[AdviceOutcome] = []
-    for side, items in (
-        ("buy", [item for item in plan.get("buys") or []
-                 if item.get("action", "买入") == "买入"]),
-        ("sell", [item for item in plan.get("holdings") or []
-                  if str(item.get("action", "")).startswith("清理")]),
-    ):
-        for item in items:
-            code = str(item["code"])
-            frame = _bars(paths, code)
-            adj = _adjusted(frame)
-            entry = float(adj["open"].get(pd.Timestamp(target_day), np.nan))
-            returns: dict[int, float | None] = {}
-            excess: dict[int, float | None] = {}
-            for horizon in horizons:
-                if len(sessions) <= horizon or sessions[horizon] > data_end:
-                    returns[horizon] = None
-                    excess[horizon] = None
-                    continue
-                value = _return_at(adj["close"], sessions[horizon], entry)
-                returns[horizon] = value
-                bench_value = _return_at(bench["close"], sessions[horizon], bench_entry)
-                excess[horizon] = (
-                    (1.0 + value) / (1.0 + bench_value) - 1.0
-                    if value is not None and bench_value is not None
-                    else None
-                )
-            reference = _cleanup_reference(item) if side == "sell" else item.get("limit")
-            touched: bool | None = None
-            if (
-                side == "sell"
-                and reference is not None
-                and len(sessions) > EXECUTION_WINDOW
-                and sessions[EXECUTION_WINDOW] <= data_end
-            ):
-                window = frame["high"].loc[
-                    pd.Timestamp(sessions[1]) : pd.Timestamp(sessions[EXECUTION_WINDOW])
-                ]
-                touched = bool((window >= float(reference)).any())
-            window_end = sessions[min(EXECUTION_WINDOW, len(sessions) - 1)]
-            outcomes.append(
-                AdviceOutcome(
-                    target_day=target_day,
-                    code=code,
-                    name=str(item.get("name", code)),
-                    side=side,
-                    action=str(item.get("action", "")),
-                    reference=None if reference is None else float(reference),
-                    returns=returns,
-                    excess=excess,
-                    touched=touched,
-                    executed=_executed(trades, code, side, target_day, window_end),
-                )
+    fingerprint = str((plan.get("rules") or {}).get("fingerprint", ""))
+
+    def make(
+        item: dict[str, Any],
+        side: str,
+        action: str,
+        category: str,
+        reference: float | None,
+    ) -> AdviceOutcome:
+        code = str(item["code"])
+        frame = _bars(paths, code)
+        adj = _adjusted(frame)
+        entry = float(adj["open"].get(pd.Timestamp(target_day), np.nan))
+        returns: dict[int, float | None] = {}
+        excess: dict[int, float | None] = {}
+        for horizon in horizons:
+            if len(sessions) <= horizon or sessions[horizon] > data_end:
+                returns[horizon] = None
+                excess[horizon] = None
+                continue
+            value = _return_at(adj["close"], sessions[horizon], entry)
+            returns[horizon] = value
+            bench_value = _return_at(bench["close"], sessions[horizon], bench_entry)
+            excess[horizon] = (
+                (1.0 + value) / (1.0 + bench_value) - 1.0
+                if value is not None and bench_value is not None
+                else None
             )
+        touched: bool | None = None
+        if (
+            side == "sell"
+            and category in ("stock", "etf")
+            and reference is not None
+            and len(sessions) > EXECUTION_WINDOW
+            and sessions[EXECUTION_WINDOW] <= data_end
+        ):
+            window = frame["high"].loc[
+                pd.Timestamp(sessions[1]) : pd.Timestamp(sessions[EXECUTION_WINDOW])
+            ]
+            touched = bool((window >= float(reference)).any())
+        window_end = sessions[min(EXECUTION_WINDOW, len(sessions) - 1)]
+        return AdviceOutcome(
+            target_day=target_day,
+            code=code,
+            name=str(item.get("name", code)),
+            side=side,
+            action=action,
+            reference=reference,
+            returns=returns,
+            excess=excess,
+            touched=touched,
+            executed=_executed(trades, code, side, target_day, window_end),
+            category=category,
+            fingerprint=fingerprint,
+        )
+
+    for item in plan.get("buys") or []:
+        if item.get("action", "买入") != "买入":
+            continue
+        limit = item.get("limit")
+        reference = float(limit) if isinstance(limit, int | float) else None
+        outcomes.append(make(item, "buy", "买入", "stock", reference))
+    for item in plan.get("holdings") or []:
+        action = str(item.get("action", ""))
+        if not action.startswith("清理"):
+            continue
+        category = "etf" if _is_etf(str(item["code"])) else "stock"
+        outcomes.append(make(item, "sell", action, category, _cleanup_reference(item)))
+    for item in plan.get("base_orders") or []:
+        shares = int(item.get("shares") or 0)
+        if shares <= 0:
+            continue
+        limit = item.get("limit")
+        reference = float(limit) if isinstance(limit, int | float) and float(limit) > 0 else None
+        outcomes.append(make(item, "buy", "底仓补仓", "base", reference))
+    for item in plan.get("steady_orders") or []:
+        lots = int(item.get("lots") or 0)
+        if lots == 0:
+            continue
+        side = "buy" if lots > 0 else "sell"
+        action = "稳健加仓" if lots > 0 else "稳健减仓"
+        outcomes.append(make(item, side, action, "steady", None))
     return outcomes
 
 
@@ -231,15 +281,22 @@ def summarize(outcomes: Sequence[AdviceOutcome]) -> str:
     if not outcomes:
         return "# 建议追踪\n\n还没有可追踪的提醒（`plan` 会同时写 .json，从下一份开始累积）。\n"
 
-    buys = [item for item in outcomes if item.side == "buy"]
-    sells = [item for item in outcomes if item.side == "sell"]
+    buys = [item for item in outcomes if item.category == "stock" and item.side == "buy"]
+    sells = [item for item in outcomes if item.category == "stock" and item.side == "sell"]
+    etf_orders = [item for item in outcomes if item.category in ("base", "steady", "etf")]
+    etf_buys = [item for item in etf_orders if item.side == "buy"]
+    etf_sells = [item for item in etf_orders if item.side == "sell"]
     days = sorted({item.target_day for item in outcomes})
+    fingerprints = sorted({item.fingerprint for item in outcomes if item.fingerprint})
     lines = [
         "# 建议追踪",
         "",
         f"覆盖 {len(days)} 个建议日（{days[0]} ~ {days[-1]}），共 {len(outcomes)} 条可执行建议。",
-        "",
     ]
+    if fingerprints:
+        warning = "；**指纹已变化，样本外失效**" if len(fingerprints) > 1 else ""
+        lines.append(f"规则指纹：{', '.join(fingerprints)}{warning}。")
+    lines.append("")
     if all(item.returns.get(1) is None for item in outcomes):
         lines += [
             "> 这些建议的 T+1 行情还没走到（数据还没到建议日之后），下面整表是 “—” "
@@ -278,15 +335,34 @@ def summarize(outcomes: Sequence[AdviceOutcome]) -> str:
 
     lines += [
         "",
-        "## 三、明细",
+        "## 三、ETF 建议（底仓/稳健/波段）",
         "",
-        "| 建议日 | 代码 | 名称 | 动作 | 参考价 | T+1 | T+5 | T+20 | "
-        "T+5超额 | 条件单触发 | 已执行 |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
-    for item in sorted(outcomes, key=lambda o: (o.target_day, o.code)):
+    if etf_orders:
+        lines += [
+            f"- 条数 {len(etf_orders)}（买入 {len(etf_buys)}、减仓 {len(etf_sells)}）",
+            f"- 买入 T+5 平均超额 {_fmt(_mean(item.excess.get(5) for item in etf_buys), 2)}，"
+            f"T+20 平均超额 {_fmt(_mean(item.excess.get(20) for item in etf_buys), 2)}",
+            f"- 减仓 T+5 平均涨跌 {_fmt(_mean(item.returns.get(5) for item in etf_sells), 2)}"
+            "（正值表示“没减”这段时间反而涨了）",
+            f"- 已执行：{_rate(item.executed for item in etf_orders)}",
+        ]
+    else:
+        lines.append("- 无")
+
+    lines += [
+        "",
+        "## 四、明细",
+        "",
+        "| 建议日 | 类别 | 代码 | 名称 | 动作 | 参考价 | T+1 | T+5 | T+20 | "
+        "T+5超额 | 条件单触发 | 已执行 |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    category_name = {"stock": "个股", "base": "底仓", "steady": "稳健", "etf": "ETF"}
+    for item in sorted(outcomes, key=lambda o: (o.target_day, o.category, o.code)):
         lines.append(
-            f"| {item.target_day} | {item.code} | {item.name} | {item.action} | "
+            f"| {item.target_day} | {category_name.get(item.category, item.category)} | "
+            f"{item.code} | {item.name} | {item.action} | "
             f"{'—' if item.reference is None else f'{item.reference:.3f}'} | "
             f"{_fmt(item.returns.get(1))} | {_fmt(item.returns.get(5))} | "
             f"{_fmt(item.returns.get(20))} | {_fmt(item.excess.get(5), 2)} | "

@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -41,6 +41,8 @@ from tradecompass.research.sleeves import sleeve_of
 
 LOT = 100
 COOLDOWN_DAYS = 20
+CLEANUP_PATIENCE = 10
+"""进入清理后，超过这么多交易日仍未反弹到位，就收盘前卖一半。"""
 IC_LOOKBACK = 36
 MIN_IC_HISTORY = 12
 PRIOR_WEIGHT = 0.5
@@ -95,13 +97,130 @@ DEFAULT_RULES: tuple[SleeveRule, ...] = (
 )
 
 
-def rules_fingerprint(rules: Mapping[str, SleeveRule] | None = None) -> str:
+@dataclass(frozen=True, slots=True)
+class SleeveHolding:
+    """一个板块组里的一只持仓，供 :func:`sleeve_decide` 做保留/清理判断。
+
+    ``score`` 是组内综合分：池内标的就是当日截面分，池外标的用成分股参数映射进来。
+    ``entry_day`` 为 None 表示不知道建仓日（没有成交流水），此时不享受最短持有保护。
+    """
+
+    code: str
+    entry_day: int | None
+    score: float | None
+    value: float
+    ret: float
+
+
+@dataclass(frozen=True, slots=True)
+class SleeveDecision:
+    """一个板块组的决策结果；回测与实盘共用同一份结构。"""
+
+    keep: tuple[str, ...]
+    sells: tuple[str, ...]
+    buys: tuple[str, ...]
+    topups: tuple[tuple[str, float], ...]
+    line: int
+    cut: float | None
+    room: float
+    """分完本组后剩余的可用资金；调用方要把它串给下一组。"""
+
+
+def sleeve_decide(
+    rule: SleeveRule,
+    ranked: pd.Series,
+    held: Sequence[SleeveHolding],
+    *,
+    slots: int,
+    slot_value: float,
+    day: int,
+    due: bool,
+    room: float,
+    max_price: float,
+    price_of: Callable[[str], float],
+    cooldown_until: Mapping[str, int] | None = None,
+    switch_tolerance: float = 0.0,
+    topup: str = "off",
+    topup_priority: bool = True,
+    cut: float | None = None,
+    line: int | None = None,
+    tradable: Callable[[str], bool] | None = None,
+) -> SleeveDecision:
+    """一个板块组的保留/清理/加仓/新买——**回测与实盘共用这一份规则**。
+
+    这是 ``RollingEngine.decide`` 与 ``weekly_plan.build_plan`` 的唯一实现：
+    两边只负责准备 ``held``/``ranked``/``room``，判断逻辑不再各写一套。
+
+    - ``due=False``：未到调仓日，不做清理，只在有空名额时补仓（与引擎逐日语义一致）；
+    - 保留：组内分 ≥ 保留线（名额 × 缓冲）的分数，或仍在最短持有期内；
+    - 卖出回笼的市值加回 ``room``，再考虑加仓与新买；
+    - 一手都买不起的（``price_of > max_price``）不选；冷却期内不回补；
+    - ``cut``/``line`` 允许调用方用**池内**排名覆盖保留线（实盘里自选票不挤占名次）；
+    - ``tradable`` 是资格过滤（ST/停牌/次新）；回测的候选本来就在 eligible 里，可不传。
+    """
+    cooldown = cooldown_until or {}
+    if ranked.empty:
+        return SleeveDecision(tuple(h.code for h in held), (), (), (), 0, None, room)
+    if not due and (len(held) >= slots or room < slot_value):
+        return SleeveDecision(tuple(h.code for h in held), (), (), (), 0, None, room)
+
+    if line is None:
+        line = min(int(math.ceil(slots * rule.buffer)), len(ranked))
+    if cut is None and 0 < line <= len(ranked):
+        cut = float(ranked.iloc[line - 1]) - switch_tolerance
+    keep: list[str] = []
+    for item in held:
+        if not due:
+            keep.append(item.code)
+        elif (cut is not None and item.score is not None and item.score >= cut) or (
+            item.entry_day is not None and day - item.entry_day < rule.min_hold
+        ):
+            keep.append(item.code)
+    kept = set(keep)
+    sells = [item.code for item in held if item.code not in kept]
+    room += sum(item.value for item in held if item.code in sells)
+
+    topups: list[tuple[str, float]] = []
+    if topup != "off":
+        for item in held:
+            if item.code not in kept:
+                continue
+            gap = slot_value - item.value
+            if should_top_up(gap, item.ret, topup):
+                topups.append((item.code, gap))
+    if topup_priority:
+        room -= sum(gap for _, gap in topups)
+
+    buys: list[str] = []
+    capacity = max(0, slots - len(keep))
+    for code in ranked.index:
+        if len(buys) >= capacity or room < 0.5 * slot_value:
+            break
+        if code in kept or cooldown.get(code, -1) >= day:
+            continue
+        if tradable is not None and not tradable(code):
+            continue
+        if price_of(code) > max_price:
+            continue
+        buys.append(code)
+        room -= slot_value
+    if not topup_priority:
+        room -= sum(gap for _, gap in topups)
+    return SleeveDecision(tuple(keep), tuple(sells), tuple(buys), tuple(topups), line, cut, room)
+
+
+def rules_fingerprint(
+    rules: Mapping[str, SleeveRule] | None = None,
+    extra: Mapping[str, object] | None = None,
+) -> str:
     """板块规则参数指纹（12 位 sha1）。
 
     事后追踪时用它区分“规则改了”和“市场变了”：同一指纹下的命中率才可横向比较。
+    ``extra`` 用来把仓位带阈值、50/10/40、加仓门槛等**同样会改变建议**的参数并进来，
+    否则改了这些，指纹不变，track 会把两套规则的结果混在一起。
     """
     source = DEFAULT_RULES if rules is None else tuple(rules.values())
-    payload = {
+    payload: dict[str, object] = {
         rule.name: {
             "sleeves": list(rule.sleeves),
             "factors": list(rule.factors),
@@ -112,6 +231,8 @@ def rules_fingerprint(rules: Mapping[str, SleeveRule] | None = None) -> str:
         }
         for rule in sorted(source, key=lambda r: r.name)
     }
+    if extra:
+        payload["_plan"] = dict(extra)
     digest = hashlib.sha1(
         json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
@@ -134,6 +255,8 @@ class Order:
     rule: str
     reason: str
     amount: float = 0.0
+    fraction: float = 1.0
+    """卖出比例：1.0 = 清仓，0.5 = 卖一半。买入不用。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +274,15 @@ class Trade:
 
 
 @dataclass(slots=True)
+class CleanupState:
+    """一只持仓进入存量清理后的状态。"""
+
+    start: int
+    half_sold: bool = False
+    patience_sold: bool = False
+
+
+@dataclass(slots=True)
 class EngineState:
     cash: float
     positions: dict[str, Position] = field(default_factory=dict)
@@ -158,6 +290,7 @@ class EngineState:
     last_rebalance: dict[str, int] = field(default_factory=dict)
     cooldown_until: dict[str, int] = field(default_factory=dict)
     last_trading: dict[str, int] = field(default_factory=dict)
+    cleanup: dict[str, CleanupState] = field(default_factory=dict)
 
 
 def board_of_code(code: str) -> Board:
@@ -166,6 +299,13 @@ def board_of_code(code: str) -> Board:
     if code.startswith(("sz.300", "sz.301")):
         return "gem"
     return "main"
+
+
+def half_lot(quantity: int) -> int:
+    """卖一半时取整到一手；不足两手就全卖。"""
+    if quantity < 2 * LOT:
+        return quantity
+    return (quantity // 2) // LOT * LOT
 
 
 def regime_quota(index_bars: pd.DataFrame, mapping: dict[str, float] | None = None) -> pd.Series:
@@ -194,12 +334,21 @@ class RollingEngine:
         switch_tolerance: float = 0.0,
         topup: str = "off",
         topup_priority: bool = True,
+        cash_rate: float = 0.0,
+        cleanup: str = "immediate",
     ) -> None:
         self.panel = panel
         self.rules = {rule.name: rule for rule in rules}
         self.costs = costs
         self.slots = slots
         self.prior_weight = prior_weight
+        self.cash_rate = cash_rate
+        """闲置现金的年化收益率；按 244 个交易日复利摊到每日，0 = 与旧回测可比。"""
+        self._cash_daily = (1.0 + cash_rate) ** (1.0 / 244.0) - 1.0 if cash_rate else 0.0
+        if cleanup not in ("immediate", "rebound"):
+            raise ValueError(f"cleanup 只能是 immediate/rebound，收到 {cleanup!r}")
+        self.cleanup = cleanup
+        """immediate = 调仓日次日开盘直接卖；rebound = 先标记，等反弹 MA10/MA20 或 10 日到期。"""
         self.switch_tolerance = switch_tolerance
         """换股容差：持仓掉出缓冲线后，还要有挑战者比它高出这么多分才换。
 
@@ -225,6 +374,13 @@ class RollingEngine:
             [next((r.name for r in rules if s in r.sleeves), "") for s in self.sleeve]
         )
         self.adj = panel.adj_close.ffill().to_numpy(dtype="float64")
+        self.high = panel.adj_high.ffill().to_numpy(dtype="float64")
+        self.ma10 = panel.adj_close.ffill().rolling(10, min_periods=10).mean().to_numpy(
+            dtype="float64"
+        )
+        self.ma20 = panel.adj_close.ffill().rolling(20, min_periods=20).mean().to_numpy(
+            dtype="float64"
+        )
         self.close = panel.field("close").ffill().to_numpy(dtype="float64")
         self.open = panel.field("open").to_numpy(dtype="float64")
         self.preclose = panel.field("preclose").to_numpy(dtype="float64")
@@ -425,11 +581,19 @@ class RollingEngine:
                                         float(self.close[i, j]), 0, 0.0,
                                         self.adj[i, j] / pos.entry_adj - 1.0, i - pos.entry_day))
                     del state.positions[order.code]
+                    state.cleanup.pop(order.code, None)
                     continue
                 carry.append(order)
                 continue
             scale = self.adj[i, j] / self.close[i, j]
-            shares = int(round(pos.units * scale))
+            total_shares = int(round(pos.units * scale))
+            shares = (
+                total_shares
+                if order.fraction >= 0.999
+                else min(total_shares, max(1, int(round(total_shares * order.fraction))))
+            )
+            if shares <= 0:
+                continue
             price = self.open[i, j] * (1.0 - slip)
             fee = trade_fee(self.costs, kind="stock", board=board_of_code(order.code),
                             side="sell", price_raw=price, quantity=shares)
@@ -437,7 +601,11 @@ class RollingEngine:
             entry_raw = pos.entry_adj / scale
             trades.append(Trade(day, order.code, "sell", pos.rule, order.reason, price, shares,
                                 fee, price / entry_raw - 1.0, i - pos.entry_day))
-            del state.positions[order.code]
+            if shares >= total_shares:
+                del state.positions[order.code]
+                state.cleanup.pop(order.code, None)
+            else:
+                pos.units -= shares / scale
         for order in buys:
             j = self.col[order.code]
             if order.code in state.positions or self.buy_blocked[i, j]:
@@ -515,62 +683,177 @@ class RollingEngine:
         slots = self.rule_slots(i)
         for name, rule in self.rules.items():
             n = slots.get(name, 0)
-            held = [c for c, p in state.positions.items() if p.rule == name and c not in selling]
+            held_codes = [
+                c for c, p in state.positions.items() if p.rule == name and c not in selling
+            ]
             last = state.last_rebalance.get(name)
             due = last is None or i - last >= rule.period
             # 未到调仓日：只在有空名额且额度允许时补仓（例如大盘额度恢复后），不做卖出
-            if not due and (len(held) >= n or room < slot_value):
+            if not due and (len(held_codes) >= n or room < slot_value):
                 continue
             if due:
                 state.last_rebalance[name] = i
             ranked = self.scores(rule, i)
-            if ranked.empty:
-                continue
-            line = min(int(math.ceil(n * rule.buffer)), len(ranked))
-            cut = float(ranked.iloc[line - 1]) - self.switch_tolerance
-            keep = [
-                c for c in held
-                if not due
-                or (c in ranked.index and float(ranked.loc[c]) >= cut)
-                or i - state.positions[c].entry_day < rule.min_hold
+            held = [
+                SleeveHolding(
+                    code=code,
+                    entry_day=state.positions[code].entry_day,
+                    score=float(ranked.loc[code]) if code in ranked.index else None,
+                    value=state.positions[code].units * self.adj[i, self.col[code]],
+                    ret=self.adj[i, self.col[code]] / state.positions[code].entry_adj - 1.0,
+                )
+                for code in held_codes
             ]
-            for code in held:
-                if code not in keep:
+            decision = sleeve_decide(
+                rule, ranked, held,
+                slots=n, slot_value=slot_value, day=i, due=due, room=room,
+                max_price=slot_value / LOT,
+                price_of=lambda code: float(self.close[i, self.col[code]]),
+                cooldown_until=state.cooldown_until,
+                switch_tolerance=self.switch_tolerance,
+                topup=self.topup, topup_priority=self.topup_priority,
+            )
+            room = decision.room
+            if self.cleanup == "rebound":
+                if due:
+                    for code in list(state.cleanup):
+                        current = state.positions.get(code)
+                        if (
+                            current is not None
+                            and current.rule == name
+                            and code not in decision.sells
+                        ):
+                            # 下次调仓日又回到保留线内：取消清理
+                            del state.cleanup[code]
+                for code in decision.sells:
+                    if code in state.positions and code not in state.cleanup:
+                        state.cleanup[code] = CleanupState(start=i)
+                    selling.add(code)
+            else:
+                for code in decision.sells:
                     orders.append(Order(code, "sell", name, "排名跌出缓冲区"))
                     selling.add(code)
-                    room += state.positions[code].units * self.adj[i, self.col[code]]
-            # 加仓（补到目标仓位）：按组内顺序、现金优先给谁由 topup_priority 决定。
-            # 注意必须留在同一个循环里——拆成两轮会改变 room 的记账顺序，等于改了策略。
-            topups: list[Order] = []
-            if self.topup != "off":
-                for code in keep:
-                    pos = state.positions[code]
-                    gap = slot_value - pos.units * self.adj[i, self.col[code]]
-                    ret = self.adj[i, self.col[code]] / pos.entry_adj - 1.0
-                    if should_top_up(gap, ret, self.topup):
-                        topups.append(Order(code, "buy", name, "加仓补到目标仓位", gap))
+            buys = list(decision.buys)
+            if self.cleanup == "rebound":
+                # 待清理仓位仍占名额：卖出前不补替代票，避免回测里提前买、放大换手
+                cleanup_count = sum(
+                    1
+                    for code, pos in state.positions.items()
+                    if pos.rule == name and code in state.cleanup
+                )
+                buys = buys[: max(0, n - len(decision.keep) - cleanup_count)]
             if self.topup_priority:
-                orders.extend(topups)
-                room -= sum(order.amount for order in topups)
-            # 一手买不起的剔除；冷却期内不回补
-            max_price = slot_value / LOT
-            candidates = [
-                c for c in ranked.index
-                if c not in keep
-                and state.cooldown_until.get(c, -1) < i
-                and self.close[i, self.col[c]] <= max_price
-            ]
-            for code in candidates[: max(0, n - len(keep))]:
-                if room < 0.5 * slot_value:
-                    break
+                for code, gap in decision.topups:
+                    orders.append(Order(code, "buy", name, "加仓补到目标仓位", gap))
+            for code in buys:
                 orders.append(Order(code, "buy", name, f"{name} 排名入选", slot_value))
-                room -= slot_value
             if not self.topup_priority:
-                orders.extend(topups)
+                for code, gap in decision.topups:
+                    orders.append(Order(code, "buy", name, "加仓补到目标仓位", gap))
         return orders
 
+    def _sell_fraction(
+        self,
+        state: EngineState,
+        code: str,
+        fraction: float,
+        fill: float,
+        reason: str,
+        i: int,
+        trades: list[Trade],
+    ) -> None:
+        """按复权价成交、按原始价计费；``fraction`` 0.5 取整到一手。"""
+        pos = state.positions.get(code)
+        if pos is None or not np.isfinite(fill) or fill <= 0:
+            return
+        j = self.col[code]
+        if not np.isfinite(self.close[i, j]) or self.close[i, j] <= 0:
+            return
+        scale = self.adj[i, j] / self.close[i, j]
+        if not np.isfinite(scale) or scale <= 0:
+            return
+        total_shares = int(round(pos.units * scale))
+        if total_shares <= 0:
+            return
+        shares = total_shares if fraction >= 0.999 else half_lot(total_shares)
+        if shares <= 0:
+            return
+        raw_fill = fill / scale
+        if not np.isfinite(raw_fill) or raw_fill <= 0:
+            return
+        fee = trade_fee(
+            self.costs,
+            kind="stock",
+            board=board_of_code(code),
+            side="sell",
+            price_raw=raw_fill,
+            quantity=shares,
+        )
+        state.cash += shares * fill - fee
+        entry_raw = pos.entry_adj / scale
+        trades.append(
+            Trade(
+                self.dates[i],
+                code,
+                "sell",
+                pos.rule,
+                reason,
+                raw_fill,
+                shares,
+                fee,
+                raw_fill / entry_raw - 1.0,
+                i - pos.entry_day,
+            )
+        )
+        if shares >= total_shares:
+            del state.positions[code]
+            state.cleanup.pop(code, None)
+        else:
+            pos.units -= shares / scale
+
+    def cleanup_exits(self, state: EngineState, i: int, trades: list[Trade]) -> None:
+        """存量清理：反弹 MA10 卖半、MA20 卖完；10 日未反弹则收盘前卖半（只一次）。"""
+        for code, cleanup in list(state.cleanup.items()):
+            pos = state.positions.get(code)
+            if pos is None:
+                del state.cleanup[code]
+                continue
+            j = self.col[code]
+            if not self.trading[i, j] or not np.isfinite(self.adj[i, j]):
+                continue
+            high = self.high[i, j]
+            open_ = self.open[i, j]
+            ma10 = self.ma10[i, j]
+            ma20 = self.ma20[i, j]
+            if np.isfinite(high):
+                if np.isfinite(ma10) and high >= ma10 and not cleanup.half_sold:
+                    fill = max(open_, ma10) if np.isfinite(open_) and open_ > 0 else ma10
+                    self._sell_fraction(state, code, 0.5, fill, "清理：反弹卖半", i, trades)
+                    cleanup.half_sold = True
+                    pos = state.positions.get(code)
+                if pos is not None and np.isfinite(ma20) and high >= ma20:
+                    fill = max(open_, ma20) if np.isfinite(open_) and open_ > 0 else ma20
+                    self._sell_fraction(state, code, 1.0, fill, "清理：反弹卖完", i, trades)
+                    continue
+            # 到期只卖一次；余下继续等 MA20，避免“每天卖一半”无限循环
+            if (
+                not cleanup.half_sold
+                and not cleanup.patience_sold
+                and i - cleanup.start >= CLEANUP_PATIENCE
+            ):
+                close = self.adj[i, j]
+                if np.isfinite(close) and close > 0:
+                    fill = close * (1.0 - self.costs.slippage)
+                    self._sell_fraction(state, code, 0.5, fill, "清理：到期卖半", i, trades)
+                    cleanup.half_sold = True
+                    cleanup.patience_sold = True
+
     def step(self, state: EngineState, i: int, trades: list[Trade]) -> float:
+        if self._cash_daily:
+            state.cash *= 1.0 + self._cash_daily
         self.execute_open(state, i, trades)
+        if self.cleanup == "rebound":
+            self.cleanup_exits(state, i, trades)
         value = self.equity(state, i)
         state.pending = state.pending + self.decide(state, i)
         return value
@@ -697,6 +980,7 @@ def render_rolling_markdown(
         f"**加仓：{engine.topup}**"
         f"（现金{'先给加仓' if engine.topup_priority else '先给新买入'}；"
         "no_deep_loss = 浮亏超过 20% 不补）。",
+        f"**现金收益：{engine.cash_rate:.1%}/年**（按 244 个交易日复利；0 = 旧口径）。",
         "",
         "## 板块规则",
         "",

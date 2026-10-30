@@ -146,7 +146,100 @@ def test_summarize_reports_hit_rate_and_empty_state(tmp_path: Path) -> None:
     outcomes = evaluate_plan(_plan(), paths=paths)
     text = summarize(outcomes)
     assert "T+5 跑赢沪深300" in text and "条数 1" in text
-    assert "| 建议日 | 代码 |" in text
+    assert "| 建议日 | 类别 | 代码 |" in text
+
+
+def _write_etf(paths: Paths, code: str, frame: pd.DataFrame) -> None:
+    path = rdata.etf_bars_path(paths, code)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(path)
+
+
+def _etf_plan() -> dict[str, object]:
+    return {
+        "schema": 1,
+        "as_of": "2026-03-02",
+        "target_day": TARGET.isoformat(),
+        "rules": {"fingerprint": "testfp"},
+        "buys": [],
+        "holdings": [],
+        "base_orders": [
+            {"code": "510300", "shares": 100, "limit": 10.2, "amount": 1020.0},
+            {"code": "518880", "shares": 0, "limit": 5.0, "amount": 0.0},
+        ],
+        "steady_orders": [
+            {"code": "159201", "target": 4000.0, "gap": 1000.0, "lots": 100, "order": "买入"},
+            {"code": "159501", "target": 3000.0, "gap": -500.0, "lots": -100, "order": "卖出"},
+        ],
+    }
+
+
+def test_evaluate_plan_tracks_base_and_steady_etf_orders(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    for code in ("sh.510300", "sh.518880", "sz.159201", "sz.159501"):
+        _write_etf(paths, code, _frame(step=0.05))
+    outcomes = evaluate_plan(_etf_plan(), paths=paths)
+    assert [(item.category, item.side) for item in outcomes] == [
+        ("base", "buy"),
+        ("steady", "buy"),
+        ("steady", "sell"),
+    ]
+    # 0 份的底仓建议不追踪
+    assert all(item.code != "518880" for item in outcomes)
+    text = summarize(outcomes)
+    assert "ETF 建议（底仓/稳健/波段）" in text and "规则指纹：testfp" in text
+    assert "条数 3（买入 2、减仓 1）" in text
+
+
+def test_base_etf_execution_matches_trade(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    for code in ("sh.510300", "sh.518880", "sz.159201", "sz.159501"):
+        _write_etf(paths, code, _frame(step=0.05))
+    trades = pd.DataFrame(
+        {
+            "date": [pd.Timestamp(TARGET), pd.Timestamp(DAYS[-1])],
+            "code": ["510300", "510300"],
+            "side": ["buy", "buy"],
+        }
+    )
+    outcomes = evaluate_plan(_etf_plan(), paths=paths, trades=trades)
+    base = [item for item in outcomes if item.category == "base"][0]
+    assert base.executed is True
+
+
+def test_etf_holding_uses_etf_bars_and_category(tmp_path: Path) -> None:
+    """用户持仓里的行业 ETF 不在静态名单，也要按 ETF 读行情、标成 ETF。"""
+    paths = _paths(tmp_path)
+    _write_etf(paths, "sz.159636", _frame(step=0.02))
+    plan = {
+        "schema": 1,
+        "target_day": TARGET.isoformat(),
+        "holdings": [
+            {
+                "code": "159636",
+                "action": "清理：反弹分批",
+                "price": 10.0,
+                "ma10": 10.5,
+                "ma20": 11.0,
+                "quantity": 1000,
+            }
+        ],
+    }
+    outcomes = evaluate_plan(plan, paths=paths)
+    assert len(outcomes) == 1
+    assert outcomes[0].category == "etf"
+    assert outcomes[0].returns[5] is not None
+
+
+def test_load_history_since_filters_for_oos(tmp_path: Path) -> None:
+    directory = tmp_path / "plans"
+    directory.mkdir()
+    for day in ("2026-03-02", "2026-03-03"):
+        (directory / f"{day}.json").write_text(
+            json.dumps({"schema": 1, "target_day": day}), encoding="utf-8"
+        )
+    plans = load_history(directory, since=date(2026, 3, 3))
+    assert [item["target_day"] for item in plans] == ["2026-03-03"]
 
 
 def test_horizons_beyond_available_data_stay_unknown(tmp_path: Path) -> None:

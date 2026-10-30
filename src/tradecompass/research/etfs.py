@@ -3,9 +3,8 @@
 资产类别在 ``asset_class``（equity_broad/equity_value/sector/overseas/
 overseas_sector/commodity/bond），策略族由 ``strategy_of`` 推导：
 
-- ``core_band``：A股宽基/红利、海外宽基——核心持有 + 250 日位置仓位带；
-- ``core_band_high_floor``：黄金/商品——核心仓位更高（floor 0.7），只在极端高位减；
-- ``hold``：债券——战略持有/再平衡，不做股票式仓位带；
+- ``core_band``：A股宽基/红利、海外宽基——核心持有 + 250 日位置仓位带（月末重算）；
+- ``hold``：黄金/商品、债券——战略持有/再平衡，不做股票式仓位带；
 - ``swing_cleanup``：行业/主题、海外行业——不新增，按 MA20 清理，趋势强度只做展示。
 
 ``t0/qdii/aum/avg_amount/tracking_error`` 是元数据占位：目前只用于分类/展示，
